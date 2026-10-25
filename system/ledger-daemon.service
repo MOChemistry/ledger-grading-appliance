@@ -1,0 +1,12 @@
+[Unit]
+Description=Paragon Ledger API Daemon
+After=network.target
+ConditionPathExists=/etc/paragon/.env
+[Service]
+User=paragon
+Group=paragon
+WorkingDirectory=/opt/ledger/daemon
+ExecStart=/opt/ledger/venv/bin/python /opt/ledger/daemon/vertex-api-daemon.py
+Restart=always
+[Install]
+WantedBy=multi-user.target

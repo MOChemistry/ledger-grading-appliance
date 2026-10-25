@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Never commit these
+.env
+*.env
+sa.json
+*.key
+registry.tsv
+*.db
+*.sqlite
+*.sqlite3
+.ledger-prompt.txt
+
+# Scans, output, logs
+*.pdf
+*.log

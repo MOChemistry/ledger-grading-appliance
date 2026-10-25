@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Start Ledger
+Comment=Launch The Ledger grading application
+Exec=/opt/ledger/venv/bin/python "/opt/ledger/engine/ledger-main-minimus.py"
+Path=/opt/ledger/engine
+Icon=/opt/ledger/engine/start_ledger.svg
+Terminal=false
+Categories=Education;
