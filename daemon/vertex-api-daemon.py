@@ -116,7 +116,7 @@ ENV_PATH = os.environ.get("LEDGER_ENV_PATH") or "/etc/paragon/.env"
 HOST = "127.0.0.1"
 PORT = 5000
 CACHE_TTL = "43200s"                  # 12 hours, matching the GUI's note (Google path)
-FALLBACK_MODEL = "gemini-3.1-pro-preview"   # gemini-3.1-pro-preview is preview-only / leapfrogged
+FALLBACK_MODEL = "gemini-4-argon"   # current Gemini flagship (GA 2026-10-13)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -182,7 +182,7 @@ if not _HAS_GOOGLE and not _HAS_ANTHROPIC_KEY:
 # request that omits model_name still lands on a live route. A box with Google
 # configured keeps the exact v2.x fallback behavior.
 if not _HAS_GOOGLE and not ENV.get("LEDGER_DEFAULT_MODEL"):
-    DEFAULT_MODEL = "claude-sonnet-4-6"
+    DEFAULT_MODEL = "claude-sonnet-5-5"
 
 # [PATCH:google-devapi] Which Google route this box is using, surfaced on the
 # health endpoint: "developer-api" (AI Studio key) | "vertex" | "absent".

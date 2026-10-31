@@ -3720,7 +3720,7 @@ class LedgerGUI:
                 base64_header = self.image_to_base64_png(header_path)
                 
                 prompt = (
-                    "You are receiving a cropped image showing the top-right corner of a chemistry assignment containing a Bartonian ID.\n"
+                    "You are receiving a cropped image showing the top-right corner of an assignment containing a Bartonian ID.\n"
                     "Return ONLY a valid, flat JSON object using EXACTLY this template: "
                     '{"bartonian_id": 125} \n\n'
                     "CRITICAL OCR RULES FOR BARTONIAN ID:\n"
