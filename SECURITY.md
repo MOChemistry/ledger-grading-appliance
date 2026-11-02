@@ -1,8 +1,10 @@
 # Security
 
-> **This is experimental software for evaluation by IT professionals.** It has not been security-audited or penetration-tested. Nothing on this page is a warranty or a guarantee; it describes the design as published. Provided "as is" under the AGPL v3.0 with no liability on the part of the author or Paragon Electrical Contracting, LLC (d/b/a Paragon, LLC and ParagonK12, LLC). See [DISCLAIMER.md](DISCLAIMER.md).
+> Experimental software for evaluation by school and district IT professionals; see [DISCLAIMER.md](DISCLAIMER.md).
 
 ## This release is not hardened
+
+It has not been security-audited or penetration-tested; this page describes the design as published.
 
 A machine built from this repository is an **ordinary Debian desktop with one extra program**. It has:
 

@@ -1,6 +1,6 @@
 # Contributing
 
-> **Experimental software for evaluation by IT professionals.** Provided "as is" with no warranty and no liability on the part of the author or Paragon Electrical Contracting, LLC (d/b/a Paragon, LLC and ParagonK12, LLC). See [DISCLAIMER.md](DISCLAIMER.md).
+> Experimental software for evaluation by school and district IT professionals; see [DISCLAIMER.md](DISCLAIMER.md).
 
 Thank you for evaluating The Ledger.
 

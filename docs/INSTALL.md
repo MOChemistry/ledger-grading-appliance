@@ -1,7 +1,7 @@
 # Building an Evaluation Machine
 
-> **EXPERIMENTAL SOFTWARE — FOR EVALUATION BY SCHOOL AND DISTRICT IT PROFESSIONALS ONLY.**
-> These steps build a **test** machine. It is not hardened: no disk encryption, no hardware-key login, no kiosk lockdown. Do not install it on any network, or use it with real student work, without the approvals your institution requires. Use test material during evaluation. Every score must be reviewed by a licensed educator. Provided "as is", with no warranty and no liability on the part of the author or Paragon Electrical Contracting, LLC (d/b/a Paragon, LLC and ParagonK12, LLC). See [DISCLAIMER.md](../DISCLAIMER.md).
+> Experimental software for evaluation by school and district IT professionals; see [DISCLAIMER.md](../DISCLAIMER.md).
+> These steps build a **test** machine with no disk encryption, hardware-key login or kiosk lockdown. Use test material, and get the approvals your institution requires before processing any student work.
 
 This procedure is written for a technically qualified operator setting up a dedicated test machine. It was exercised from a blank disk on 2026-10-24 (Lenovo ThinkCentre M700 Tiny, Debian 13.7). Every command is typed into a terminal, then Enter.
 

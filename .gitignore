@@ -17,3 +17,6 @@ registry.tsv
 # Scans, output, logs
 *.pdf
 *.log
+
+# Blank master documents shipped as examples
+!samples/*.pdf

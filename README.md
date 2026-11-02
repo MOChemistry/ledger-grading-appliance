@@ -13,16 +13,12 @@ It was built and tested in October 2026 on Debian 13.7 running on a Lenovo Think
 
 ## Before you evaluate
 
-Evaluation is your institution's decision and your institution's responsibility. In particular:
-
 - **Get approval first.** Do not install or run this software on any network, or with any real student work, without the approvals your district or institution requires.
-- **Use test material.** Evaluate with blank or synthetic documents. Do not process real student work unless your institution has approved it and has whatever data-privacy agreement it requires with the AI provider you choose.
-- **This build is not hardened.** It is an ordinary Debian desktop with one extra program — no disk encryption, no hardware-key login, no kiosk lockdown. See [SECURITY.md](SECURITY.md).
-- **AI output can be wrong.** Every score and every comment must be reviewed by a licensed educator before it is used for anything.
+- **Use test material.** This build is not hardened — an ordinary Debian desktop, no disk encryption — and AI output can be wrong. Evaluate with blank or synthetic documents, and have a licensed educator review every score before it is used. See [SECURITY.md](SECURITY.md).
 
 ## How it works
 
-1. A document is laid out in the Ledger format: a title, a three-digit ID box, a page number, and boxed answer regions.
+1. A document is laid out in the Ledger format: a title, an ID line, a page number, and tagged answer boxes. The rules are in **[docs/ASSIGNMENT_FORMAT.md](docs/ASSIGNMENT_FORMAT.md)**; blank examples are in **[samples/](samples/)**.
 2. The paper documents are scanned to PDF and placed in the **02 Inbox Scans** folder.
 3. The software reads each page's title and ID, prepares images (see the table below), and sends them to the AI provider together with a blank copy of the document and the scoring instructions entered by the operator.
 4. The software writes a *conspectus* PDF per ID — the scanned pages, item-by-item feedback, and a score — plus a `Tabula.csv` of scores. A gradebook view can export a CSV.
@@ -49,9 +45,7 @@ The ID box is intended to hold a pseudonym assigned by the operator. The roster 
 
 What a provider does with the images after they leave the machine is governed by **that provider's terms**, not by this software. Those terms differ by account type and change over time. This repository does not describe them and makes no claim about them. Read them, and have your institution review them, before entering a key.
 
-When a Google AI Studio key is entered, the setup screen requires the operator to confirm that billing is enabled on the key's project and links to Google's terms. That screen is a reminder, not a determination that any provider's terms are suitable for your institution.
-
-All provider charges appear on the account whose key is entered. Neither the author nor Paragon is responsible for them.
+When a Google AI Studio key is entered, the setup screen requires the operator to confirm that billing is enabled on the key's project and links to Google's terms. All provider charges appear on the account whose key is entered.
 
 ## Building a test machine
 
@@ -67,7 +61,7 @@ The build procedure is **[docs/INSTALL.md](docs/INSTALL.md)**. It assumes a tech
 
 ## Scoring instructions
 
-The software ships with **no built-in scoring instructions**; the operator enters them. The **[prompts/](prompts/)** folder holds six example instruction sets (Math, Chemistry, AP Chemistry, College Physics, and two for Social Studies). They are examples for evaluation, not validated rubrics, and no claim is made about the accuracy of scores they produce.
+The software ships with **no built-in scoring instructions**; the operator enters them. The **[prompts/](prompts/)** folder holds six example instruction sets (Math, Chemistry, AP Chemistry, College Physics, and two for Social Studies). They are examples, not validated rubrics.
 
 ## Status
 
@@ -86,7 +80,7 @@ This software is released under the **GNU Affero General Public License v3.0** �
 
 ## About the author
 
-The Ledger was written independently by a Missouri high-school chemistry teacher, on personal time and outside his employment. It is not affiliated with or endorsed by any school district. His background is why the project exists; it is not a claim that the software is ready for any classroom. See [DISCLAIMER.md](DISCLAIMER.md), section 6.
+The Ledger was written independently by a Missouri high-school chemistry teacher, on personal time and personal equipment, outside his employment, and is not affiliated with or endorsed by any school district. See [DISCLAIMER.md](DISCLAIMER.md), section 6.
 
 ## Contributing
 
