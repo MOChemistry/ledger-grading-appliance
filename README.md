@@ -65,7 +65,7 @@ The software ships with **no built-in scoring instructions**; the operator enter
 
 ## Status
 
-- **v1.0.0 — experimental evaluation release.** Built from a blank disk and exercised against both providers on 2026-10-24. Not tested for security, accessibility, accuracy at scale, or compliance with any law or policy.
+- **v1.0.x — experimental evaluation release.** Built from a blank disk and exercised against both providers on 2026-10-24. Intended for evaluation by a technically qualified operator. See [SECURITY.md](SECURITY.md) and [DISCLAIMER.md](DISCLAIMER.md).
 - A separate, hardened build exists for controlled pilots. It is not part of this release.
 
 ## The web app
