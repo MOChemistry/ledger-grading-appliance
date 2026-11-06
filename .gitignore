@@ -20,3 +20,6 @@ registry.tsv
 
 # Blank master documents shipped as examples
 !samples/*.pdf
+
+# Formatter exemplars (invented sample content) shipped as references
+!formatter/references/exemplars/*.pdf

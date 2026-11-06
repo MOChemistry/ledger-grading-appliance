@@ -32,13 +32,17 @@ GUI_DONE_MD5="447aa2ba1acd7f0fa81c4dcfbe4b22a2"    # same file after the Phase 4
 DAEMON_MD5="ba87a2bab0235905c89b50f5f13ea7ca"      # daemon/vertex-api-daemon.py, v2.9
 GUI_WO2_MD5="a203148b26bbe18b5c71a8e991a3c62b"     # GUI after WO2 + WO3 (master dc1ad54)
 DAEMON_WO2_MD5="552951d9cf33b1c2ddb981d335bd2e95"  # daemon after WO2 (one comment line; WO3 left it alone, master dc1ad54)
+GUI_V110_MD5="b1228b36f7859694a0c954dda6d5cefd"    # engine with the v1.1.0 assignment formatter (FORMAT ASSIGNMENT window)
+DAEMON_V110_MD5="4d75aa0d9a9446e265236192297b8e20" # daemon v2.10 (formatter endpoints)
 
 APT_PKGS=(python3-venv python3-tk python3-dev tesseract-ocr tesseract-ocr-eng zenity wmctrl
           texlive-xetex texlive-latex-extra texlive-science texlive-fonts-recommended
-          libgl1 libglib2.0-0t64 fonts-liberation)   # last three were already on a fresh install
+          libgl1 libglib2.0-0t64 fonts-liberation    # last three were already on a fresh install
+          bubblewrap)   # v1.1.0: sandboxes the formatter's layout-script runs
 GROUPS_NEW=(ledger-teacher faculty-admin district-admin)
 ENGINE_SKIP=(ledger-keymgr-gui.py ledger-firstlogin-passwd.py Start_KeyMgr.desktop)   # appliance-only
-WORKSPACE_DIRS=("01 Master Assignments" "02 Inbox Scans" "03 Classes" "04 SIS Exports" "05 Archive Originals")
+WORKSPACE_DIRS=("01 Master Assignments" "02 Inbox Scans" "03 Classes" "04 SIS Exports" "05 Archive Originals"
+                "06 Formatted Assignments")   # v1.1.0: the formatter's results folder
 
 while (( $# )); do
     case "$1" in
@@ -81,12 +85,19 @@ done
 command -v git >/dev/null || die "git is not installed: sudo apt install git"
 GUI_NOW="$(md5sum < "$SOURCE/engine/ledger-main-minimus.py" | cut -d' ' -f1)"
 DAEMON_NOW="$(md5sum < "$SOURCE/daemon/vertex-api-daemon.py" | cut -d' ' -f1)"
-if [[ "$GUI_NOW" == "$GUI_WO2_MD5" && "$DAEMON_NOW" == "$DAEMON_WO2_MD5" ]]; then
-    FINAL=1   # the public-repository tree: already the accepted build, nothing to patch
+if [[ "$GUI_NOW" == "$GUI_V110_MD5" && "$DAEMON_NOW" == "$DAEMON_V110_MD5" ]]; then
+    FINAL=1   # the v1.1.0 public-repository tree (formatter included): nothing to patch
+elif [[ "$GUI_NOW" == "$GUI_WO2_MD5" && "$DAEMON_NOW" == "$DAEMON_WO2_MD5" ]]; then
+    FINAL=1   # the v1.0.x public-repository tree: already the accepted build, nothing to patch
 elif [[ "$GUI_NOW" == "$GUI_SRC_MD5" && "$DAEMON_NOW" == "$DAEMON_MD5" ]]; then
     FINAL=0   # the original clone tree: the two embedded patches bring it to the accepted build
 else
     die "engine/daemon are not a version this script was tested with"
+fi
+if [[ "$GUI_NOW" == "$GUI_V110_MD5" ]]; then
+    for f in formatter/formatter_core.py formatter/SKILL.md formatter/scripts/ledger_lib.py; do
+        [[ -f "$SOURCE/$f" ]] || die "missing $SOURCE/$f (the v1.1.0 engine needs the formatter folder; use --source DIR)"
+    done
 fi
 log "OK     Debian $VERSION_ID, user $OWNER, source $SOURCE ($( (( FINAL )) && echo 'accepted build, no patches needed' || echo 'original tree, patches will be applied'))"
 
@@ -125,7 +136,7 @@ if [[ -x "$OPT/venv/bin/python" ]]; then
 else
     act "create the venv" as_owner python3 -m venv "$OPT/venv"
 fi
-act "install pinned Python packages (45 pins)" as_owner "$OPT/venv/bin/python" -m pip install -q -r "$REQ"
+act "install pinned Python packages (47 pins)" as_owner "$OPT/venv/bin/python" -m pip install -q -r "$REQ"
 act "check Python dependencies" as_owner "$OPT/venv/bin/python" -m pip check
 
 # ---------------------------------------------------------------- 4. source copy + git (only on a fresh /opt/ledger)
@@ -141,6 +152,9 @@ else
         fi
     done
     act "copy daemon" cp -- "$SOURCE/daemon/vertex-api-daemon.py" "$OPT/daemon/"
+    if [[ -d "$SOURCE/formatter" ]]; then
+        act "copy formatter (v1.1.0)" cp -a -- "$SOURCE/formatter" "$OPT/formatter"
+    fi
     act "own copied files" chown -R "$OWNER:ledger-teacher" "$OPT/engine" "$OPT/daemon"
 
     act "git init" as_owner git -C "$OPT" init -q -b master
@@ -962,6 +976,24 @@ B64
     rm -f "$PATCH"
     fi
 fi
+# ---------------------------------------------------------------- 4b. formatter (v1.1.0)
+# The FORMAT ASSIGNMENT window's layout kit. Installed (or refreshed) whether
+# $OPT is fresh or an existing install; skipped when it already matches.
+tree_sum() { (cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 md5sum | md5sum | cut -d' ' -f1); }
+if [[ ! -d "$SOURCE/formatter" ]]; then
+    log "SKIP   formatter (not in this source tree -- pre-v1.1.0 source)"
+else
+    FMT_SRC_SUM="$(tree_sum "$SOURCE/formatter")"
+    FMT_DST_SUM=""
+    [[ -d "$OPT/formatter" ]] && FMT_DST_SUM="$(tree_sum "$OPT/formatter")"
+    if [[ "$FMT_SRC_SUM" == "$FMT_DST_SUM" ]]; then
+        skip "formatter/ (matches the source tree)"
+    else
+        act "install formatter/ into $OPT (replaces any older copy)" \
+            bash -c "rm -rf '$OPT/formatter.new' && cp -a '$SOURCE/formatter' '$OPT/formatter.new' && rm -rf '$OPT/formatter' && mv '$OPT/formatter.new' '$OPT/formatter'"
+    fi
+fi
+
 act "re-own $OPT (edits and git change the group)" chown -R "$OWNER:ledger-teacher" "$OPT"
 act "re-close $OPT to others" chmod -R u=rwX,g=rX,o= "$OPT"
 

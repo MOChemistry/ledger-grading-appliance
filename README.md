@@ -25,6 +25,10 @@ It was built and tested in October 2026 on Debian 13.7 running on a Lenovo Think
 
 Two providers are supported: **Google** (Gemini models, via a Google AI Studio key or a Google Cloud project) and **Anthropic** (Claude models). At least one is required.
 
+## Formatting assignments (v1.1.0)
+
+The **FORMAT ASSIGNMENT** window re-typesets an existing assignment — a PDF or pasted questions — into the Ledger format described in [docs/ASSIGNMENT_FORMAT.md](docs/ASSIGNMENT_FORMAT.md). The AI model writes a short Python layout script, and the machine runs that script locally, sandboxed with bubblewrap (no network access), to produce the PDF; the result is then checked against the same layout rules the scoring engine relies on. The source assignment is sent to the configured provider, and **each format run costs API usage on the operator's own key**. Claude (`claude-fable-5`) is the tested model; results with Gemini models vary. Details: [docs/FORMATTER.md](docs/FORMATTER.md).
+
 ## What leaves the machine
 
 Every image below is sent over the internet to the AI provider configured on the machine. **Review this table against your institution's data-governance policy before testing with any real material.**
@@ -36,6 +40,7 @@ Every image below is sent over the internet to the AI provider configured on the
 | A crop of the ID box | Every scanned page | The ID written on the page (intended to be a pseudonym the operator assigns — see below) |
 | Crops of the boxed answer regions | Every page, **WORKSHEET (BOXED)** mode | Handwriting inside the boxes, and anything else inside them |
 | **Whole pages**, downscaled | Every page, **ESSAY (FULL-PAGE)** mode | **Everything on the page**, including any name or other writing outside the boxes |
+| The source assignment (page images, extracted text, and on the Claude route the PDF itself) | Every **FORMAT ASSIGNMENT** run | The assignment being formatted |
 
 The software does not send a roster, real names it has stored, or the gradebook. It cannot stop a person from writing a name, or anything else, on the paper, and in ESSAY mode the whole page is sent.
 
@@ -66,6 +71,7 @@ The software ships with **no built-in scoring instructions**; the operator enter
 ## Status
 
 - **v1.0.x — experimental evaluation release.** Built from a blank disk and exercised against both providers on 2026-10-24. Intended for evaluation by a technically qualified operator. See [SECURITY.md](SECURITY.md) and [DISCLAIMER.md](DISCLAIMER.md).
+- **v1.1.0 — adds the assignment formatter.** The scoring path is unchanged. See [docs/FORMATTER.md](docs/FORMATTER.md).
 - A separate, hardened build exists for controlled pilots. It is not part of this release.
 
 ## The web app

@@ -22,6 +22,7 @@ These statements describe intended behavior. Verify them in your own evaluation 
 - **Images sent to the provider.** See the table "What leaves the machine" in the [README](README.md). In short: the blank master pages, a title crop, an ID crop from every page, and either cropped answer boxes (WORKSHEET mode) or **whole pages** (ESSAY mode).
 - **Stored on the machine.** Scans, conspectus PDFs, `Tabula.csv` files, the roster, scores, and settings are stored unencrypted in the operator's home folder. A factory reset (ADVANCED menu) removes the provider keys and stops the AI service; it does **not** delete these files.
 - **The AI service** (`ledger-daemon`) listens on `127.0.0.1:5000` only and is not designed to accept connections from the network.
+- **The assignment formatter** (v1.1.0) **runs AI-written layout code on the machine**: the model returns a Python build script, and the machine executes it with the project's own interpreter, sandboxed with bubblewrap — no network access, a 120-second limit, write access only to its scratch folder. If bubblewrap is unavailable the run proceeds unsandboxed and the result says so. The source assignment is sent to the configured provider, and each format run costs API usage on the operator's key. See [docs/FORMATTER.md](docs/FORMATTER.md).
 - **The build script** installs packages, creates `/opt/ledger`, and installs the service. It does not open ports, add firewall rules, or grant passwordless `sudo`.
 
 ## Reporting a security problem

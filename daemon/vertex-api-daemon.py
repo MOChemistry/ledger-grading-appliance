@@ -1,8 +1,30 @@
 #!/usr/bin/env python3
 """
-vertex-api-daemon.py  --  The Ledger's local AI broker  (v2.9, multi-provider
+vertex-api-daemon.py  --  The Ledger's local AI broker  (v2.10, multi-provider
 + direct Anthropic API route + multi-image Silo 2 + Google-optional startup
-+ vendor-default sampling + Gemini Developer-API route).
++ vendor-default sampling + Gemini Developer-API route + formatter endpoints).
+
+[PATCH:formatter] v2.10 (WO-F1): a new, self-contained endpoint family for the
+FORMAT ASSIGNMENT window. It changes nothing about the four evaluation
+endpoints above it:
+  /api/formatter/start   POST {model_name, system, messages} -> {status, job_id}
+                         (returns immediately; the provider call runs in a
+                         background thread; ONE formatter job at a time)
+  /api/formatter/status  GET ?job_id=... -> {state: running|done|error,
+                         text, usage, message}
+Routing is by _provider_for(model_name) exactly as the other endpoints.
+Anthropic: the system text rides as a cache_control system block and the
+call is STREAMED (long outputs exceed the non-streaming SDK window).
+Google: the system text rides as system_instruction. The output limit is
+LEDGER_FORMATTER_MAX_TOKENS (default 32000), separate from the evaluation
+limit; a reply cut off at the limit returns an error, never a truncated
+script. Token usage (input / cache write / cache read / output) is logged
+per call; keys and assignment content are never logged. The daemon still
+sends NO sampling or thinking parameters on this route.
+[PATCH:formatter] v2.10 also adds the LEDGER_PORT test seam next to
+LEDGER_ENV_PATH: tests run a second copy of this daemon on a spare port as
+the logged-in user. Production never sets it; the systemd unit carries no
+such variable.
 
 [PATCH:google-devapi] v2.9 (WO-A7): the Google route can be provisioned with a
 Google AI Studio API key (LEDGER_GOOGLE_API_KEY, "AIza...") INSTEAD of a GCP
@@ -114,7 +136,13 @@ from google.genai.errors import APIError
 # Production never sets it; the systemd unit carries no such variable.
 ENV_PATH = os.environ.get("LEDGER_ENV_PATH") or "/etc/paragon/.env"
 HOST = "127.0.0.1"
-PORT = 5000
+# [PATCH:formatter] LEDGER_PORT is a test seam like LEDGER_ENV_PATH above:
+# tests run a branch copy of this daemon on a spare port as the logged-in
+# user. Production never sets it; the systemd unit carries no such variable.
+try:
+    PORT = int(os.environ.get("LEDGER_PORT") or "5000")
+except ValueError:
+    PORT = 5000
 CACHE_TTL = "43200s"                  # 12 hours, matching the GUI's note (Google path)
 FALLBACK_MODEL = "gemini-4-argon"   # current Gemini flagship (GA 2026-10-13)
 
@@ -896,8 +924,206 @@ def silo2():
         return jsonify({"status": "error", "message": str(exc)}), 500
 
 
+# ---------------------------------------------------------------------------
+# [PATCH:formatter] /api/formatter/*  --  WO-F1 assignment-formatter endpoints
+# Self-contained: nothing above this block changed behavior. One job at a
+# time; the provider call runs in a background thread so /start returns at
+# once and the GUI polls /status. No sampling or thinking parameters are
+# sent, matching the daemon-wide rule.
+# ---------------------------------------------------------------------------
+import time  # [PATCH:formatter] job ids
+
+try:
+    FORMATTER_MAX_TOKENS = int(ENV.get("LEDGER_FORMATTER_MAX_TOKENS") or "32000")
+except ValueError:
+    FORMATTER_MAX_TOKENS = 32000
+
+_formatter_lock = threading.Lock()
+_formatter_job = {"id": None, "state": None, "text": None, "usage": None,
+                  "message": None}
+
+
+def _formatter_anthropic_content(content):
+    """Convert the GUI's neutral content list into Anthropic blocks.
+    Entries: {type: text|image|document, ...}. Data arrives base64-encoded."""
+    blocks = []
+    for item in content:
+        t = item.get("type")
+        if t == "text":
+            blocks.append({"type": "text", "text": item.get("text", "")})
+        elif t == "image":
+            blocks.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": item.get("media_type", "image/png"),
+                    "data": item.get("data", ""),
+                },
+            })
+        elif t == "document":
+            blocks.append({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": item.get("media_type", "application/pdf"),
+                    "data": item.get("data", ""),
+                },
+            })
+    return blocks
+
+
+def _formatter_google_parts(content):
+    """Convert the GUI's neutral content list into google-genai Parts.
+    PDF document blocks are SKIPPED on this route (the page images and
+    extracted text already carry the source); that is logged once."""
+    parts = []
+    skipped_docs = 0
+    for item in content:
+        t = item.get("type")
+        if t == "text":
+            parts.append(types.Part.from_text(text=item.get("text", "")))
+        elif t == "image":
+            parts.append(types.Part.from_bytes(
+                data=base64.b64decode(item.get("data", "")),
+                mime_type=item.get("media_type", "image/png")))
+        elif t == "document":
+            skipped_docs += 1
+    if skipped_docs:
+        log.info("Formatter (Google route): %d PDF document block(s) skipped "
+                 "(page images + extracted text carry the source).", skipped_docs)
+    return parts
+
+
+def _run_formatter_job(job_id, model_name, system_text, messages):
+    """Background worker: one provider call, result parked in _formatter_job."""
+    try:
+        if _provider_for(model_name) == "anthropic":
+            ac = _get_anthropic_client()
+            system_blocks = [{
+                "type": "text",
+                "text": system_text or "",
+                "cache_control": _anthropic_cache_control(),
+            }]
+            conv = [{"role": m.get("role", "user"),
+                     "content": _formatter_anthropic_content(m.get("content") or [])}
+                    for m in messages]
+            # Long outputs: the SDK requires streaming past the non-streaming
+            # window; stream and collect the final message.
+            with ac.messages.stream(
+                model=model_name,
+                max_tokens=FORMATTER_MAX_TOKENS,
+                system=system_blocks,
+                messages=conv,
+            ) as stream:
+                msg = stream.get_final_message()
+            u = getattr(msg, "usage", None)
+            usage = {
+                "input": getattr(u, "input_tokens", None),
+                "cache_write": getattr(u, "cache_creation_input_tokens", None),
+                "cache_read": getattr(u, "cache_read_input_tokens", None),
+                "output": getattr(u, "output_tokens", None),
+            }
+            log.info("Formatter usage (model=%s): input=%s cache_write=%s "
+                     "cache_read=%s output=%s", model_name, usage["input"],
+                     usage["cache_write"], usage["cache_read"], usage["output"])
+            if getattr(msg, "stop_reason", None) == "max_tokens":
+                raise RuntimeError(
+                    "The reply was cut off at the "
+                    f"{FORMATTER_MAX_TOKENS}-token formatter output limit and "
+                    "was discarded. Raise LEDGER_FORMATTER_MAX_TOKENS in "
+                    "/etc/paragon/.env and restart ledger-daemon.service.")
+            text = _anthropic_text(msg)
+        else:
+            gc = _require_google()
+            contents = []
+            for m in messages:
+                role = "model" if m.get("role") == "assistant" else "user"
+                parts = _formatter_google_parts(m.get("content") or [])
+                if parts:
+                    contents.append(types.Content(role=role, parts=parts))
+            cfg = types.GenerateContentConfig(
+                system_instruction=system_text or None,
+                max_output_tokens=FORMATTER_MAX_TOKENS,
+            )
+            resp = gc.models.generate_content(
+                model=model_name, contents=contents, config=cfg)
+            u = getattr(resp, "usage_metadata", None)
+            usage = {
+                "input": getattr(u, "prompt_token_count", None),
+                "cache_write": None,
+                "cache_read": getattr(u, "cached_content_token_count", None),
+                "output": getattr(u, "candidates_token_count", None),
+            }
+            log.info("Formatter usage (model=%s): input=%s cache_write=%s "
+                     "cache_read=%s output=%s", model_name, usage["input"],
+                     usage["cache_write"], usage["cache_read"], usage["output"])
+            finish = None
+            cands = getattr(resp, "candidates", None) or []
+            if cands:
+                finish = str(getattr(cands[0], "finish_reason", "") or "")
+            if finish and "MAX_TOKENS" in finish.upper():
+                raise RuntimeError(
+                    "The reply was cut off at the "
+                    f"{FORMATTER_MAX_TOKENS}-token formatter output limit and "
+                    "was discarded. Raise LEDGER_FORMATTER_MAX_TOKENS in "
+                    "/etc/paragon/.env and restart ledger-daemon.service.")
+            text = resp.text or ""
+        with _formatter_lock:
+            if _formatter_job["id"] == job_id:
+                _formatter_job["state"] = "done"
+                _formatter_job["text"] = text
+                _formatter_job["usage"] = usage
+    except Exception as exc:  # noqa: BLE001 - every failure surfaces to the GUI
+        log.exception("formatter job failed")
+        with _formatter_lock:
+            if _formatter_job["id"] == job_id:
+                _formatter_job["state"] = "error"
+                _formatter_job["message"] = str(exc)
+
+
+@app.post("/api/formatter/start")
+def formatter_start():
+    try:
+        body = request.get_json(force=True) or {}
+        model_name = body.get("model_name") or DEFAULT_MODEL
+        system_text = body.get("system", "")
+        messages = body.get("messages") or []
+        with _formatter_lock:
+            if _formatter_job["state"] == "running":
+                return jsonify({"status": "error",
+                                "message": "A formatting job is already "
+                                           "running. Wait for it to finish."}), 409
+            job_id = f"fmt-{int(time.time() * 1000)}"
+            _formatter_job.update(id=job_id, state="running", text=None,
+                                  usage=None, message=None)
+        n_img = sum(1 for m in messages for c in (m.get("content") or [])
+                    if c.get("type") == "image")
+        log.info("Formatter job %s started (model=%s, %d message(s), "
+                 "%d image(s)).", job_id, model_name, len(messages), n_img)
+        threading.Thread(target=_run_formatter_job,
+                         args=(job_id, model_name, system_text, messages),
+                         daemon=True).start()
+        return jsonify({"status": "success", "job_id": job_id})
+    except Exception as exc:  # noqa: BLE001
+        log.exception("formatter/start failed")
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+@app.get("/api/formatter/status")
+def formatter_status():
+    job_id = request.args.get("job_id", "")
+    with _formatter_lock:
+        if _formatter_job["id"] != job_id:
+            return jsonify({"state": "error", "text": None, "usage": None,
+                            "message": "Unknown job id."}), 404
+        return jsonify({"state": _formatter_job["state"],
+                        "text": _formatter_job["text"],
+                        "usage": _formatter_job["usage"],
+                        "message": _formatter_job["message"]})
+
+
 if __name__ == "__main__":
-    log.info("Ledger AI daemon (v2.9, multi-provider + direct Anthropic API route + multi-image Silo 2 + Google-optional + vendor-default sampling + per-chunk master context + Gemini Developer-API route) listening on http://%s:%d", HOST, PORT)
+    log.info("Ledger AI daemon (v2.10, multi-provider + direct Anthropic API route + multi-image Silo 2 + Google-optional + vendor-default sampling + per-chunk master context + Gemini Developer-API route + formatter endpoints) listening on http://%s:%d", HOST, PORT)
     log.info("Google route for this box: %s", _google_route)
     log.info("Claude route for this box: %s", _anthropic_route)
     serve(app, host=HOST, port=PORT, threads=4)

@@ -43,3 +43,6 @@ urllib3==2.7.0
 waitress==3.0.2
 websockets==16.0
 Werkzeug==3.1.8
+# [PATCH:formatter] WO-F1 assignment formatter dependencies (pinned)
+reportlab==5.1.0
+matplotlib==3.11.2

@@ -234,6 +234,10 @@ UNEVALUATED_DIR = os.path.join(LEDGER_DIR, "02 Inbox Scans")
 COURSES_DIR = os.path.join(LEDGER_DIR, "03 Classes")
 SIS_EXPORTS_DIR = os.path.join(LEDGER_DIR, "04 SIS Exports")
 ORIGINAL_SCANS_DIR = os.path.join(LEDGER_DIR, "05 Archive Originals")
+# [PATCH:formatter] WO-F1: formatter work lives beside the other workspace
+# folders; the core logic lives in /opt/ledger/formatter (no GUI imports).
+FORMATTED_DIR = os.path.join(LEDGER_DIR, "06 Formatted Assignments")
+FORMATTER_CODE_DIR = os.path.join(os.path.dirname(ENGINE_DIR), "formatter")
 
 PERIODS = [
     "1st Period", "2nd Period", "3rd Period", "4th Period", 
@@ -604,8 +608,21 @@ class LedgerGUI:
         except Exception as e:
             self.log_message(f"[!] Role-Based Sidebar Error: {e}")
 
-        # Spacer
-        self.sidebar.grid_rowconfigure(12, weight=1)
+        # [PATCH:formatter] FORMAT ASSIGNMENT — visible to every account,
+        # styled like its neighbors. Sits under the existing rows (0-11);
+        # the spacer moves from row 12 to row 13 so nothing above shifts.
+        self.formatter_btn = ctk.CTkButton(
+            self.sidebar,
+            text="FORMAT ASSIGNMENT",
+            font=self.main_font,
+            fg_color="#333333",
+            hover_color="#555555",
+            command=self.open_formatter_window
+        )
+        self.formatter_btn.grid(row=12, column=0, padx=20, pady=(10, 10))
+
+        # Spacer  ([PATCH:formatter] moved 12 -> 13 for the new button)
+        self.sidebar.grid_rowconfigure(13, weight=1)
 
         self.main_area = ctk.CTkFrame(self.root, fg_color="transparent")
         self.main_area.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
@@ -2117,9 +2134,19 @@ class LedgerGUI:
                 
         save_btn = ctk.CTkButton(calib_win, text="SAVE & PROCEED" if is_intercept else "SAVE", font=self.header_font, height=50, fg_color="#1e8449", hover_color="#27ae60", command=save_and_proceed)
         save_btn.pack(pady=(10, 20))
-        
+
         self._make_text_copyable(calib_win)
         calib_win.grab_set()
+
+        # [PATCH:formatter] Test seam, same pattern as self._wizard_hooks and
+        # self._fmt_hooks: lets the WO-F2 acceptance driver drag the REAL
+        # calibration boxes (through their own mouse handlers) and press the
+        # REAL save path. Never read in production.
+        self._calib_hooks = {"win": calib_win, "scale": scale_factor,
+                             "boxes": {"title": box_title, "id": box_id,
+                                       "footer": box_footer},
+                             "save": save_and_proceed,
+                             "is_intercept": is_intercept}
 
     def open_roster_manager(self):
         """Launches the dedicated appliance GUI for managing the SQLite Roster and FERPA Pseudonyms."""
@@ -3050,7 +3077,7 @@ class LedgerGUI:
             )
 
     def verify_directories(self):
-        dirs = [LEDGER_DIR, ENGINE_DIR, DIAGNOSTIC_DIR, MASTER_DIR, COURSES_DIR, UNEVALUATED_DIR, ORIGINAL_SCANS_DIR, TEMP_DIR, SIS_EXPORTS_DIR]
+        dirs = [LEDGER_DIR, ENGINE_DIR, DIAGNOSTIC_DIR, MASTER_DIR, COURSES_DIR, UNEVALUATED_DIR, ORIGINAL_SCANS_DIR, TEMP_DIR, SIS_EXPORTS_DIR, FORMATTED_DIR]  # [PATCH:formatter]
         for period in PERIODS:
             dirs.extend([
                 os.path.join(COURSES_DIR, period), 
@@ -3082,6 +3109,13 @@ class LedgerGUI:
             self.status_label.configure(text="SYSTEM: IDLE", text_color="#1e8449")
 
     def start_ledger(self):
+        # [PATCH:formatter] RUN cannot start while a format job is running
+        # (and the formatter window refuses to Send while RUN is evaluating).
+        if getattr(self, "formatter_busy", False):
+            self.log_message("[!] A formatting job is running. Wait for it "
+                             "to finish before starting an evaluation.")
+            return
+
         # [PATCH:no-default-prompt] Empty (or whitespace-only) instructions:
         # refuse before anything starts -- no calibration window, no batch,
         # nothing sent to the daemon. The system never leaves idle.
@@ -4692,6 +4726,520 @@ class LedgerGUI:
         self.clean_temp_directory()
         self.is_running = False
         self.log_message("=== BATCH PROCESSING CONCLUDED. TEMP FOLDER SCRUBBED. ===")
+
+    # ======================================================================
+    # [PATCH:formatter] WO-F1: FORMAT ASSIGNMENT
+    # New code only. The heavy lifting lives in /opt/ledger/formatter/
+    # (formatter_core.py — no GUI imports); this window just drives it.
+    # ======================================================================
+    def get_formatter_setting(self, key, default=""):
+        """Read one per-account Settings value (formatter keys only)."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT Setting_Value FROM Settings WHERE Setting_Key = ?", (key,))
+            result = cursor.fetchone()
+            conn.close()
+            return result[0] if (result and result[0]) else default
+        except Exception as e:
+            self.log_message(f"[!] Database Read Error ({key}): {e}")
+            return default
+
+    def set_formatter_setting(self, key, value):
+        """Write one per-account Settings value (formatter keys only)."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO Settings (Setting_Key, Setting_Value) VALUES (?, ?)",
+                (key, str(value)))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            self.log_message(f"[!] Database Write Error ({key}): {e}")
+
+    def _formatter_core(self):
+        """Lazy import of formatter_core (keeps GUI startup unchanged)."""
+        import importlib
+        import sys as _sys
+        if FORMATTER_CODE_DIR not in _sys.path:
+            _sys.path.insert(0, FORMATTER_CODE_DIR)
+        return importlib.import_module("formatter_core")
+
+    def _formatter_set_master(self, pdf_path):
+        """Load a formatted PDF through the existing LOAD MASTER PDF path:
+        same state, same labels, same downstream behavior."""
+        self.master_pdf_path = pdf_path
+        filename = os.path.basename(pdf_path)
+        self.master_status_label.configure(text=f"MASTER: {filename}", text_color="#1e8449")
+        self.log_message(f"Master Copy loaded: {filename}. Ready for batch verification.")
+
+    def open_formatter_window(self):
+        if getattr(self, "_fmt_win", None) is not None:
+            try:
+                if self._fmt_win.winfo_exists():
+                    self._fmt_win.lift()
+                    return
+            except tk.TclError:
+                pass
+        try:
+            core = self._formatter_core()
+        except Exception as e:
+            self.log_message(f"[!] The formatter is not installed correctly: {e}")
+            return
+
+        win = ctk.CTkToplevel(self.root)
+        self._fmt_win = win
+        win.title("FORMAT ASSIGNMENT")
+        # The reference display is 1360x768; everything must fit in 1280x700.
+        _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win.geometry(f"{min(1270, _sw - 40)}x{min(690, _sh - 60)}")
+        win.minsize(1000, 620)
+
+        ui_font = ctk.CTkFont(family="Ubuntu", size=14)
+        small_font = ctk.CTkFont(family="Ubuntu", size=12)
+        conv_font = ctk.CTkFont(family="Ubuntu", size=16)
+
+        st = {"session": None, "file": None, "pasted": None, "view": None,
+              "previews": []}
+        self.formatter_busy = False
+
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_columnconfigure(1, weight=0)
+        win.grid_rowconfigure(1, weight=1)
+
+        # ---------------- top strip ----------------
+        top = ctk.CTkFrame(win, fg_color="#1a1a1a")
+        top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4))
+
+        rowA = ctk.CTkFrame(top, fg_color="transparent")
+        rowA.pack(fill="x", padx=8, pady=(8, 2))
+
+        file_label = ctk.CTkLabel(rowA, text="No file chosen", font=small_font,
+                                  text_color="#9a9a9a", width=190, anchor="w")
+
+        def choose_file():
+            try:
+                result = subprocess.run(
+                    ['zenity', '--file-selection', '--title=CHOOSE THE ASSIGNMENT',
+                     '--file-filter=Assignments | *.pdf *.png *.jpg *.jpeg *.txt *.docx'],
+                    capture_output=True, text=True)
+                path = result.stdout.strip()
+            except FileNotFoundError:
+                path = filedialog.askopenfilename(
+                    title="CHOOSE THE ASSIGNMENT",
+                    filetypes=[("Assignments", "*.pdf *.png *.jpg *.jpeg *.txt *.docx")])
+            if not path:
+                return
+            if path.lower().endswith(".docx") and not (shutil.which("libreoffice") or shutil.which("soffice")):
+                say_ledger("Please save it as a PDF first.")
+                return
+            st["file"] = path
+            st["pasted"] = None
+            file_label.configure(text=os.path.basename(path), text_color="white")
+
+        def paste_text_dialog():
+            d = ctk.CTkToplevel(win)
+            d.title("Paste the questions")
+            d.geometry("640x440")
+            d.transient(win)
+            box = ctk.CTkTextbox(d, font=ui_font, wrap="word")
+            box.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+
+            def ok():
+                text = box.get("1.0", "end").strip()
+                if text:
+                    st["pasted"] = text
+                    st["file"] = None
+                    file_label.configure(text=f"pasted text ({len(text)} characters)",
+                                         text_color="white")
+                d.destroy()
+            ctk.CTkButton(d, text="USE THIS TEXT", font=ui_font,
+                          fg_color="#1e8449", hover_color="#27ae60",
+                          command=ok).pack(pady=(0, 12))
+            self._make_text_copyable(d)
+            d.after(200, d.grab_set)
+
+        ctk.CTkButton(rowA, text="Choose File", font=ui_font, width=110,
+                      fg_color="#1f538d", hover_color="#14375e",
+                      command=choose_file).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(rowA, text="Paste Text", font=ui_font, width=90,
+                      fg_color="#333333", hover_color="#555555",
+                      command=paste_text_dialog).pack(side="left", padx=(0, 6))
+        file_label.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(rowA, text="Title:", font=ui_font).pack(side="left")
+        title_entry = ctk.CTkEntry(rowA, font=ui_font, width=260)
+        title_entry.pack(side="left", padx=(4, 10))
+
+        recent_values = ["Recent..."] + [name for name, _p in core.list_recent()][:12]
+        recent_var = ctk.StringVar(value="Recent...")
+
+        def open_recent(choice):
+            if choice == "Recent...":
+                return
+            recent_var.set("Recent...")
+            for name, p in core.list_recent():
+                if name == choice:
+                    load_session(p)
+                    return
+
+        ctk.CTkOptionMenu(rowA, variable=recent_var, values=recent_values,
+                          font=small_font, width=160,
+                          command=open_recent).pack(side="right")
+
+        rowB = ctk.CTkFrame(top, fg_color="transparent")
+        rowB.pack(fill="x", padx=8, pady=(2, 2))
+
+        ctk.CTkLabel(rowB, text="Your ID Name:", font=ui_font).pack(side="left")
+        id_entry = ctk.CTkEntry(rowB, font=ui_font, width=190,
+                                placeholder_text="Example: Smithian ID")
+        id_entry.pack(side="left", padx=(4, 12))
+        # Prefill: this account's saved formatter name first; otherwise the
+        # roster label UNLESS it is still the factory default (then the field
+        # stays empty and Send is refused until a name is typed).
+        _saved_fmt_id = self.get_formatter_setting("formatter_id_label", "")
+        _roster_id = self.get_custom_id_label()
+        if _saved_fmt_id:
+            id_entry.insert(0, _saved_fmt_id)
+        elif _roster_id != "Bartonian ID":
+            id_entry.insert(0, _roster_id)
+
+        type_selector = ctk.CTkSegmentedButton(
+            rowB, values=["Assignment", "Quiz", "Exam"], font=ui_font, height=30)
+        type_selector.set("Assignment")
+        type_selector.pack(side="left", padx=(0, 12))
+
+        key_var = ctk.StringVar(value="off")
+        ctk.CTkCheckBox(rowB, text="Make Answer Key", font=ui_font,
+                        variable=key_var, onvalue="on", offvalue="off").pack(side="left")
+
+        roster_note = ctk.CTkLabel(top, text="", font=small_font,
+                                   text_color="#7f8c8d", anchor="w")
+        roster_note.pack(fill="x", padx=10, pady=(0, 6))
+
+        # ---------------- left: the conversation ----------------
+        left = ctk.CTkFrame(win, fg_color="transparent")
+        left.grid(row=1, column=0, sticky="nsew", padx=(8, 4), pady=4)
+        left.grid_rowconfigure(0, weight=1)
+        left.grid_columnconfigure(0, weight=1)
+
+        conv = ctk.CTkTextbox(left, font=conv_font, wrap="word",
+                              fg_color="#121212", corner_radius=10)
+        conv.grid(row=0, column=0, columnspan=2, sticky="nsew")
+        conv_tk = getattr(conv, "_textbox", conv)
+        conv_tk.tag_config("teacher", foreground="#7fb3ff")
+        conv_tk.tag_config("ledger", foreground="#2ecc71")
+        conv_tk.tag_config("quiet", foreground="#8a8a8a")
+        conv.configure(state="disabled")
+
+        def _append_conv(text, tag):
+            conv.configure(state="normal")
+            conv_tk.insert("end", text + "\n\n", tag)
+            conv.configure(state="disabled")
+            conv_tk.see("end")
+
+        def say_teacher(text):
+            _append_conv("You:  " + text, "teacher")
+
+        def say_ledger(text):
+            _append_conv("Ledger:  " + text, "ledger")
+
+        def say_quiet(text):
+            _append_conv(text, "quiet")
+
+        entry_box = ctk.CTkTextbox(left, font=conv_font, height=64, wrap="word")
+        entry_box.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        entry_tk = getattr(entry_box, "_textbox", entry_box)
+
+        send_btn = ctk.CTkButton(left, text="Send", font=self.main_font,
+                                 width=90, height=60, fg_color="#1e8449",
+                                 hover_color="#27ae60")
+        send_btn.grid(row=1, column=1, sticky="ns", padx=(6, 0), pady=(6, 0))
+
+        # ---------------- right: previews ----------------
+        right = ctk.CTkFrame(win, fg_color="#1a1a1a", width=400)
+        right.grid(row=1, column=1, sticky="nsew", padx=(4, 8), pady=4)
+        right.grid_propagate(False)
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+
+        view_label = ctk.CTkLabel(right, text="No version yet", font=ui_font)
+        view_label.grid(row=0, column=0, pady=(8, 2))
+
+        pv_frame = ctk.CTkScrollableFrame(right, fg_color="#101010")
+        pv_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=2)
+
+        btn_row = ctk.CTkFrame(right, fg_color="transparent")
+        btn_row.grid(row=2, column=0, pady=(4, 8))
+
+        def _shown_version():
+            sess = st["session"]
+            if not sess or not sess.state["versions"]:
+                return None
+            idx = st["view"]
+            if idx is None:
+                idx = len(sess.state["versions"]) - 1
+            return sess.state["versions"][idx]
+
+        def show_version(idx=None):
+            sess = st["session"]
+            for w in pv_frame.winfo_children():
+                w.destroy()
+            st["previews"] = []
+            if not sess or not sess.state["versions"]:
+                view_label.configure(text="No version yet")
+                return
+            n_total = len(sess.state["versions"])
+            if idx is None:
+                idx = n_total - 1
+            idx = max(0, min(idx, n_total - 1))
+            st["view"] = idx
+            v = sess.state["versions"][idx]
+            view_label.configure(text=f"Version {v['n']} of {n_total}")
+            for p in v.get("previews", []):
+                try:
+                    img = Image.open(p)
+                    w = 352
+                    h = int(img.height * w / img.width)
+                    cimg = ctk.CTkImage(light_image=img, dark_image=img, size=(w, h))
+                    st["previews"].append(cimg)
+                    ctk.CTkLabel(pv_frame, image=cimg, text="").pack(pady=4)
+                except Exception:
+                    continue
+
+        def open_pdf():
+            v = _shown_version()
+            if v:
+                subprocess.Popen(["xdg-open", v["pdf_path"]])
+
+        def previous_version():
+            sess = st["session"]
+            if not sess or not sess.state["versions"]:
+                return
+            n_total = len(sess.state["versions"])
+            idx = st["view"] if st["view"] is not None else n_total - 1
+            show_version((idx - 1) % n_total)
+
+        def use_as_master():
+            v = _shown_version()
+            if not v:
+                return
+            sess = st["session"]
+            base = re.sub(r'[^A-Za-z0-9 _()\-]', '', sess.state["title"]).strip() or "Formatted Assignment"
+            dest = os.path.join(MASTER_DIR, f"{base} v{v['n']}.pdf")
+            try:
+                shutil.copy(v["pdf_path"], dest)
+            except Exception as e:
+                say_ledger(f"Could not copy into 01 Master Assignments: {e}")
+                return
+            self._formatter_set_master(dest)
+            say_ledger(f"Version {v['n']} was copied into 01 Master Assignments "
+                       "and loaded as the master.")
+
+        ctk.CTkButton(btn_row, text="Open PDF", font=small_font, width=100,
+                      fg_color="#1f538d", hover_color="#14375e",
+                      command=open_pdf).pack(side="left", padx=3)
+        ctk.CTkButton(btn_row, text="Previous Version", font=small_font, width=120,
+                      fg_color="#333333", hover_color="#555555",
+                      command=previous_version).pack(side="left", padx=3)
+        ctk.CTkButton(btn_row, text="Use As Master", font=small_font, width=110,
+                      fg_color="#1e8449", hover_color="#27ae60",
+                      command=use_as_master).pack(side="left", padx=3)
+
+        # ---------------- bottom edge ----------------
+        bottom = ctk.CTkFrame(win, fg_color="transparent")
+        bottom.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
+        ctk.CTkLabel(bottom, text="Formatter Model:", font=small_font).pack(side="left")
+        model_entry = ctk.CTkEntry(bottom, font=small_font, width=200)
+        model_entry.insert(0, self.get_formatter_setting("formatter_model",
+                                                         "claude-fable-5"))
+        model_entry.pack(side="left", padx=(4, 12))
+        status_label = ctk.CTkLabel(bottom, text="", font=small_font,
+                                    text_color="#e67e22", anchor="w")
+        status_label.pack(side="left", fill="x", expand=True)
+
+        # ---------------- transcript helpers ----------------
+        def record(role, text):
+            sess = st["session"]
+            if sess is not None:
+                sess.state.setdefault("transcript", []).append(
+                    {"role": role, "text": text})
+                sess.save()
+
+        def load_session(folder):
+            try:
+                sess = core.FormatterSession.load(folder)
+            except Exception as e:
+                say_ledger(f"Could not reopen that one: {e}")
+                return
+            st["session"] = sess
+            st["view"] = None
+            conv.configure(state="normal")
+            conv_tk.delete("1.0", "end")
+            conv.configure(state="disabled")
+            title_entry.delete(0, "end")
+            title_entry.insert(0, sess.state.get("title", ""))
+            id_entry.delete(0, "end")
+            id_entry.insert(0, sess.state.get("id_label", ""))
+            type_selector.set(sess.state.get("doc_type", "Assignment"))
+            key_var.set("on" if sess.state.get("make_key") else "off")
+            model_entry.delete(0, "end")
+            model_entry.insert(0, sess.state.get("model", "claude-fable-5"))
+            file_label.configure(text="(reopened)", text_color="white")
+            st["file"] = "(loaded)"
+            for turn in sess.state.get("transcript", []):
+                if turn["role"] == "teacher":
+                    say_teacher(turn["text"])
+                elif turn["role"] == "quiet":
+                    say_quiet(turn["text"])
+                else:
+                    say_ledger(turn["text"])
+            show_version()
+
+        # ---------------- send ----------------
+        def _finish_job(result_text_fn):
+            self.formatter_busy = False
+            send_btn.configure(state="normal")
+            status_label.configure(text="")
+            result_text_fn()
+
+        def _worker(instruction, new_session_args):
+            core_mod = core
+            try:
+                if new_session_args is not None:
+                    sess = core_mod.FormatterSession.create(**new_session_args)
+                    st["session"] = sess
+                else:
+                    sess = st["session"]
+                # keep per-send choices in the session
+                sess.state["model"] = new_model[0]
+                sess.state["id_label"] = new_label[0]
+                sess.state["doc_type"] = new_type[0]
+                sess.state["make_key"] = new_key[0]
+                result = sess.send(instruction,
+                                   log=lambda m: self.root.after(
+                                       0, lambda mm=m: status_label.configure(
+                                           text="Working on it. This usually "
+                                                "takes a few minutes.  (" + mm + ")")))
+            except Exception as e:
+                msg = str(e)
+
+                def fail():
+                    say_ledger(msg)
+                    record("ledger", msg)
+                self.root.after(0, _finish_job, fail)
+                return
+
+            def done():
+                if not result["ok"]:
+                    say_ledger(result["error"] or "Something went wrong.")
+                    record("ledger", result["error"] or "Something went wrong.")
+                    return
+                reply_parts = []
+                if result["note"]:
+                    reply_parts.append(result["note"])
+                reply_parts.append(result["check_text"])
+                for wmsg in result["warnings"]:
+                    reply_parts.append(wmsg)
+                reply_parts.append("Let me know if you need to make "
+                                   "additional formatting adjustments.")
+                reply = "\n\n".join(reply_parts)
+                say_ledger(reply)
+                record("ledger", reply)
+                st["view"] = None
+                show_version()
+            self.root.after(0, _finish_job, done)
+
+        new_model = [""]
+        new_label = [""]
+        new_type = ["Assignment"]
+        new_key = [False]
+
+        def send_message(event=None):
+            if self.formatter_busy:
+                return "break"
+            if self.is_running:
+                say_ledger("The Ledger is evaluating right now. The formatter "
+                           "can start when the run finishes.")
+                return "break"
+            id_label = id_entry.get().strip()
+            if not id_label:
+                say_ledger("Type your ID name first. It prints at the top of "
+                           "every page.")
+                return "break"
+            instruction = entry_box.get("1.0", "end").strip()
+            new_session_args = None
+            if st["session"] is None:
+                title = title_entry.get().strip()
+                if not (st["file"] or st["pasted"]):
+                    say_ledger("Choose your assignment file (or paste the "
+                               "questions as text) first.")
+                    return "break"
+                if not title:
+                    say_ledger("Type a title first. It prints at the top of "
+                               "every page.")
+                    return "break"
+                new_session_args = {
+                    "title": title, "id_label": id_label,
+                    "doc_type": type_selector.get(),
+                    "make_key": key_var.get() == "on",
+                    "model": model_entry.get().strip() or "claude-fable-5",
+                    "file_path": st["file"] if st["file"] not in (None, "(loaded)") else None,
+                    "pasted_text": st["pasted"],
+                }
+                if not instruction:
+                    instruction = "Format this assignment in Ledger format."
+            elif not instruction:
+                say_ledger("Type what you would like changed, then press Send.")
+                return "break"
+
+            # persist the per-account preferences
+            self.set_formatter_setting("formatter_model",
+                                       model_entry.get().strip() or "claude-fable-5")
+            self.set_formatter_setting("formatter_id_label", id_label)
+            _roster = self.get_custom_id_label()
+            if _roster != id_label:
+                note_text = (f'Your roster uses "{_roster}". Change it in '
+                             "ROSTER if you want reports to match.")
+                roster_note.configure(text=note_text)
+
+            new_model[0] = model_entry.get().strip() or "claude-fable-5"
+            new_label[0] = id_label
+            new_type[0] = type_selector.get()
+            new_key[0] = key_var.get() == "on"
+
+            say_teacher(instruction)
+            record("teacher", instruction)
+            entry_box.delete("1.0", "end")
+            self.formatter_busy = True
+            send_btn.configure(state="disabled")
+            status_label.configure(text="Working on it. This usually takes "
+                                        "a few minutes.")
+            threading.Thread(target=_worker,
+                             args=(instruction, new_session_args),
+                             daemon=True).start()
+            return "break"
+
+        send_btn.configure(command=send_message)
+        entry_tk.bind("<Return>", send_message)
+        entry_tk.bind("<Shift-Return>", lambda e: None)
+
+        say_ledger("Choose your assignment, add any special instructions, "
+                   "and press Send.")
+
+        # Test seam, same pattern as self._wizard_hooks: lets the WO-F1
+        # acceptance driver press the real buttons. Never read in production.
+        self._fmt_hooks = {"send": send_message, "entry": entry_box,
+                           "id": id_entry, "title": title_entry,
+                           "model": model_entry, "conv": conv,
+                           "status": status_label, "load_session": load_session,
+                           "show_version": show_version,
+                           "use_as_master": use_as_master,
+                           "previous_version": previous_version,
+                           "file_label": file_label, "state": st, "win": win}
+
+        self._make_text_copyable(win)
 
 if __name__ == "__main__":
     import socket
