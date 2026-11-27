@@ -33,7 +33,14 @@ import sys
 # [PATCH:formatter-spacing] minimum VISIBLE white below any answer box (pt).
 # Targets are 16 (before a sub-part label/heading) and 22 (before the next
 # question); 13 is the hard floor with rendering tolerance.
-MIN_BELOW_BOX_PT = 13.0
+# [PATCH:below-box-gap] WO-APP1 T2: the value now lives in the kit library
+# (ledger_lib.MIN_BELOW_BOX_PT), which enforces it mechanically at draw
+# time; the checker imports the SAME constant so the two can never drift.
+_SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "scripts")
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+from ledger_lib import MIN_BELOW_BOX_PT  # noqa: E402
 _RASTER_SCALE = 4.16          # the pipeline's own Matrix(4.16, 4.16)
 _FOOTER_ZONE_PT = 60.0        # ink below y=60 is the footer, not "next item"
 _TAG_RE = re.compile(r"^\d{1,2}[a-z]?$")
@@ -151,6 +158,11 @@ def check_pdf(pdf_path, expected_boxes, expected_pages=None):
 
     eng = _load_engine()
     stub = _EngineStub()
+    # [PATCH:formatter-v2-stub] WO-APP1 T1: the v2 box-map split made
+    # extract_boxes_with_opencv call self._box_map_find_rects; without this
+    # seat the AttributeError is swallowed by its except and every page
+    # reports 0 boxes. Bind the ENGINE's own finder (not a copy) to the stub.
+    stub._box_map_find_rects = eng.LedgerGUI._box_map_find_rects.__get__(stub)
     os.makedirs(eng.TEMP_DIR, exist_ok=True)
 
     import format_runner

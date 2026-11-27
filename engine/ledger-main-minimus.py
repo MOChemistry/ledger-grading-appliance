@@ -113,6 +113,84 @@ def detect_vbox_overflows(log_text, threshold_pt=5.0):
 _BOXED_DIGIT_WL = "-c tessedit_char_whitelist=0123456789"
 
 
+def build_run_summary(stats):
+    """[PATCH:run-summary] WO-COS2 T6: the end-of-run summary, display-free
+    (count_check_* helper pattern) so tests can drive it. Takes the plain
+    dict _collect_run_summary_stats builds (also what rides in a batch job
+    record) and returns the lines to print, [] when there is nothing to
+    print. Any line whose count is zero is omitted, except "Pages:"."""
+    if not stats or not stats.get("ran"):
+        return []
+    lines = ["=== RUN SUMMARY ==="]
+    students = stats.get("students", []) or []
+    n_students = len(students)
+    discards = stats.get("discards", []) or []
+    student_word = "student" if n_students == 1 else "students"
+    lines.append(
+        f"  Pages: {stats.get('pages_scanned', 0)} scanned · "
+        f"{stats.get('blank_pages', 0)} blank · "
+        f"{stats.get('pages_sorted', 0)} sorted to {n_students} {student_word} · "
+        f"{len(discards)} discarded")
+    fa = stats.get("footers_attempted", 0)
+    fr = stats.get("footers_read", 0)
+    if fa:
+        f_line = f"  Footers read: {fr} of {fa}."
+        if fr < fa and stats.get("footer_saving", True):
+            f_line += " Unreadable crops saved in .Diagnostic-Log/Footer-Rejects."
+        lines.append(f_line)
+    if stats.get("turned_upright", 0):
+        lines.append(f"  Pages turned upright: {stats['turned_upright']}")
+    if stats.get("sideways", 0):
+        lines.append(f"  Sideways pages: {stats['sideways']}")
+    for d in discards:
+        if d.get("second") is None:
+            what = f"ID read {d.get('first')}"
+        else:
+            what = f"ID read {d.get('first')}, re-read {d.get('second')}"
+        lines.append(f"  Discarded: page {d.get('page')} of {d.get('file')} — "
+                     f"{what} (not on the roster)")
+    for r in stats.get("rereads", []) or []:
+        lines.append(f"  ID re-read accepted: page {r.get('page')} of "
+                     f"{r.get('file')} — first {r.get('first')}, then "
+                     f"{r.get('second')}. Please verify.")
+    for e in stats.get("read_errors", []) or []:
+        lines.append(f"  {e.get('file')}: reading stopped at an error near "
+                     f"page {e.get('page')}. Later pages in this file were "
+                     f"NOT read.")
+    # Page-count comparison: WORKSHEET mode only. A student with MORE pages
+    # than the master is flagged too (a page may be filed under the wrong ID).
+    master_pages = stats.get("master_pages")
+    if stats.get("grading_mode", "boxed") != "essay" and master_pages:
+        for s in students:
+            n = s.get("pages", 0)
+            if n != master_pages:
+                page_word = "page" if n == 1 else "pages"
+                lines.append(
+                    f"  Page count: ID {s.get('id')} ({s.get('name')}) has "
+                    f"{n} {page_word}; the master has {master_pages}. "
+                    f"Please check.")
+    return lines
+
+
+def pass1_capacity_error(err_str):
+    """[PATCH:pass1-pacing] WO-COS2 T5: the SAME capacity test Silo 2 uses
+    (the is_capacity check in evaluate_grid_with_silo_2), on lowercased
+    error text. Used by Silo 1 to flip Pass 1 into slow pacing."""
+    return ("resource exhausted" in err_str or "429" in err_str
+            or "503" in err_str or "service unavailable" in err_str)
+
+
+def footer_summary_line(footers_read, footers_attempted, saving_enabled=True):
+    """[PATCH:footer-reader] WO-COS2 T3: the end-of-Pass-1 footer line,
+    display-free (count_check_* helper pattern) so tests can drive it.
+    The Footer-Rejects pointer only appears when saving is enabled --
+    with LEDGER_FOOTER_DEBUG=0 no crops were saved, so no pointer."""
+    line = f"Footers read: {footers_read} of {footers_attempted} pages."
+    if footers_read < footers_attempted and saving_enabled:
+        line += " Unreadable crops saved in .Diagnostic-Log/Footer-Rejects."
+    return line
+
+
 def _read_boxed_digits(gray, contour, thresh, lo=None, hi=None):
     """Return (value:int|None, raw:str).
 
@@ -222,11 +300,38 @@ LEDGER_DIR = os.path.join(HOME_DIR, "Ledger Workspace")
 # Siloed App Data (Hidden with a '.' to keep the teacher's visible workspace clean)
 TEMP_DIR = os.path.join(LEDGER_DIR, ".Temp-Ledger-Files")
 DIAGNOSTIC_DIR = os.path.join(LEDGER_DIR, ".Diagnostic-Log")
+# [PATCH:footer-reader] WO-COS2 T3: failed footer crops land here (NOT in the
+# temp folder, which is wiped at the end of every run). Emptied at the START
+# of Pass 1 of each run, so the last run's crops survive until the next run.
+FOOTER_REJECTS_DIR = os.path.join(DIAGNOSTIC_DIR, "Footer-Rejects")
+# [PATCH:box-rejects] WO-BM1 T5: rejected box-recovery crops and the ID
+# crops of pages discarded for an off-roster ID land here (same lifecycle
+# as Footer-Rejects: emptied at the START of Pass 1, kept until the next
+# run). LEDGER_BOX_DEBUG=0 disables the saving only; logging stays.
+BOX_REJECTS_DIR = os.path.join(DIAGNOSTIC_DIR, "Box-Rejects")
+ID_REJECTS_DIR = os.path.join(DIAGNOSTIC_DIR, "ID-Rejects")
 LOG_FILE = os.path.join(DIAGNOSTIC_DIR, "ledger-diagnostics.log")
 DB_PATH = os.path.join(LEDGER_DIR, ".ledger-database.db")
 
 # Shared Global Assets (Read strictly from the unified vault)
-WATERMARK_FILE = os.path.join(ENGINE_DIR, "Ledger-Watermark.png") 
+WATERMARK_FILE = os.path.join(ENGINE_DIR, "Ledger-Watermark.png")
+
+# [PATCH:cosmetics] WO-COS1 T6 / WO-COS2 T1: ONE title constant used by BOTH
+# root.title() and the wmctrl raise in __main__ (wmctrl -F -a matches the full
+# window title exactly, so sharing the constant guarantees the single-instance
+# raise finds this window and only this window).
+MAIN_WINDOW_TITLE = "THE LEDGER"
+
+# [PATCH:batch] WO-B1 test seam, mirroring the daemon's LEDGER_PORT: tests
+# point the GUI at a second daemon copy on a spare port. Production never
+# sets it, so the live URL is byte-identical to before.
+DAEMON_BASE = f"http://127.0.0.1:{os.environ.get('LEDGER_DAEMON_PORT') or '5000'}"
+
+# [PATCH:batch] A pending batch job lives in the WORKSPACE, outside the temp
+# folder, because temp is scrubbed at startup, shutdown and run end and a
+# pending job must survive all three.
+BATCH_JOB_DIR = os.path.join(LEDGER_DIR, ".Pending-Batch-Job")
+BATCH_JOB_FILE = os.path.join(BATCH_JOB_DIR, "job.json")
 
 # Visible Workspace Directories
 MASTER_DIR = os.path.join(LEDGER_DIR, "01 Master Assignments")
@@ -425,10 +530,104 @@ def wizard_provider_state(ai_key, gcp_id, has_creds, anth_key, billing_confirmed
     return _out(True, "ready", ready, ai_present, vertex_complete, anth_complete)
 # --- end [PATCH:wizard-devapi] ----------------------------------------------
 
+
+# --- [PATCH:count-check] -----------------------------------------------------
+# WO-B1: a model reply that silently drops an answer box must never commit a
+# score. These helpers are module-level and display-free (the
+# wizard_provider_state pattern) so tests/ can import and drive them.
+def count_check_norm_item(value):
+    """Normalize one item number for comparison: trim spaces, lowercase,
+    remove a single trailing ')'. '3A )' and '3a' compare equal."""
+    s = str(value).strip().lower()
+    if s.endswith(")"):
+        s = s[:-1].strip()
+    return s
+
+
+def count_check_item_list(items):
+    """Normalized item numbers of a parsed reply, in reply order."""
+    return [count_check_norm_item(it.get("item_number", ""))
+            for it in items if isinstance(it, dict)]
+
+
+def count_check_pages_label(footer_pages):
+    """Plain-words page label for dashboard lines: 'Pages 3-4', 'Page 3',
+    or 'Pages unknown' when the footer could not be read."""
+    if not footer_pages:
+        return "Pages unknown"
+    pp = sorted(footer_pages)
+    if len(pp) == 1:
+        return f"Page {pp[0]}"
+    if pp == list(range(pp[0], pp[-1] + 1)):
+        return f"Pages {pp[0]}-{pp[-1]}"
+    return "Pages " + ",".join(str(p) for p in pp)
+# --- end [PATCH:count-check] -------------------------------------------------
+
+
+# --- [PATCH:id-compose] WO-APP1 T3 -------------------------------------------
+# The formatter ID field takes the NAME only ("Smithian"); the printed label
+# composes as "<name> ID". Saved settings and reopened sessions may still
+# hold a full label ("Smithian ID") -- strip ONE trailing " ID" word on read
+# so nothing ever composes to "Smithian ID ID". Module-level and display-free
+# (the wizard_provider_state pattern) so tests/ can import and drive them.
+# Matches the browser edition's behavior.
+def id_label_strip(text):
+    """Bare name from an ID label: remove ONE trailing, space-separated
+    'ID' word, any case, any spacing. 'Smithian ID' -> 'Smithian';
+    'Smithian' and 'DAVID' (no separate ID word) come back unchanged."""
+    s = str(text or "").strip()
+    return re.sub(r"\s+id\s*$", "", s, flags=re.IGNORECASE)
+
+
+def id_label_compose(text):
+    """Printed header label from whatever the teacher typed: '<name> ID'.
+    A full label composes to itself (never 'Smithian ID ID'); an empty or
+    blank entry composes to '' (the caller refuses to send)."""
+    bare = id_label_strip(text)
+    return bare + " ID" if bare else ""
+# --- end [PATCH:id-compose] --------------------------------------------------
+
+
+# --- [PATCH:fmt-ticker] WO-APP1 T6 -------------------------------------------
+def formatter_elapsed_label(seconds):
+    """Elapsed-time text for the formatter status line: '37s', '2m 40s',
+    '1h 02m'. Module-level and display-free so tests/ can drive it."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return "%ds" % s
+    m, s = divmod(s, 60)
+    if m < 60:
+        return "%dm %02ds" % (m, s)
+    h, m = divmod(m, 60)
+    return "%dh %02dm" % (h, m)
+# --- end [PATCH:fmt-ticker] --------------------------------------------------
+
+
+# --- [PATCH:batch] -----------------------------------------------------------
+# The Silo 2 per-call prompt line and response schema, moved VERBATIM out of
+# evaluate_grid_with_silo_2 so the batch submit path carries the identical
+# model-facing text. Do not reword either (WO-B1 ground rule).
+SILO2_PROMPT = "Evaluate this grid of answers based strictly on your cached instructions."
+EVALUATION_SCHEMA = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {
+            "item_number": {"type": "STRING"},
+            "student_answer": {"type": "STRING"},
+            "status": {"type": "STRING"},
+            "feedback": {"type": "STRING"},
+            "points_earned": {"type": "NUMBER"}
+        },
+        "required": ["item_number", "student_answer", "status", "feedback", "points_earned"]
+    }
+}
+# --- end [PATCH:batch] -------------------------------------------------------
+
 class LedgerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("DASHBOARD - EXPERIMENTAL EVALUATION BUILD")
+        self.root.title(MAIN_WINDOW_TITLE)
         # [PATCH:topbar-fit] 1100 px cannot seat the essay-mode control row
         # (RUN + MAX SCORE + MODE selector + SHUT DOWN) -- the SHUT DOWN
         # button was clipped clean off the right edge. Open at 1615x920 (the
@@ -453,6 +652,8 @@ class LedgerGUI:
         self.header_font = ctk.CTkFont(family="Ubuntu", size=24, weight="bold")
         self.main_font = ctk.CTkFont(family="Ubuntu", size=18)
         self.log_font = ctk.CTkFont(family="Courier", size=16)
+        self.selector_font = ctk.CTkFont(family="Ubuntu", size=14)   # [PATCH:cosmetics] MODE/SCORING segmented buttons
+        self.log_font_bold = ctk.CTkFont(family="Courier", size=16, weight="bold")   # [PATCH:cosmetics] "===" log lines
         
         self.setup_ui()
         self.verify_directories()
@@ -460,7 +661,10 @@ class LedgerGUI:
         self.clean_temp_directory() 
         self.setup_logging()
         self.check_first_run()
-        
+        # [PATCH:batch] a pending batch job greets the teacher with the
+        # RESUME / CANCEL BATCH choice once the window is up.
+        self.root.after(800, self.check_pending_batch_job)
+
     def load_roster(self):
         """Loads the roster into memory directly from the SQLite Database."""
         roster = {}
@@ -559,7 +763,7 @@ class LedgerGUI:
             # EDIT LEDGER PROMPT - available to ALL tiers; each account edits its OWN prompt copy.
             self.edit_prompt_btn = ctk.CTkButton(
                 self.sidebar,
-                text="EDIT LEDGER PROMPT",
+                text="GRADING INSTRUCTIONS",
                 font=self.main_font,
                 fg_color="#333333",
                 hover_color="#555555",
@@ -626,7 +830,9 @@ class LedgerGUI:
 
         self.main_area = ctk.CTkFrame(self.root, fg_color="transparent")
         self.main_area.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
-        self.main_area.grid_rowconfigure(2, weight=1)
+        # [PATCH:batch] log area moved from grid row 2 to 3: the SCORING
+        # control row sits between the top row and the log.
+        self.main_area.grid_rowconfigure(3, weight=1)
         self.main_area.grid_columnconfigure(0, weight=1)
 
         self.control_frame = ctk.CTkFrame(self.main_area, fg_color="transparent")
@@ -640,7 +846,7 @@ class LedgerGUI:
         # widgets keep their space when the frame is squeezed, so on a window
         # too narrow for the whole row it is the MODE selector (packed last)
         # that clips -- never the safety-critical SHUT DOWN button.
-        self.shutdown_btn = ctk.CTkButton(self.control_frame, text="SHUT DOWN", font=self.header_font, height=55, width=160, fg_color="#c0392b", hover_color="#e74c3c", command=self.shut_down)
+        self.shutdown_btn = ctk.CTkButton(self.control_frame, text="STOP", font=self.header_font, height=55, width=120, fg_color="#c0392b", hover_color="#e74c3c", command=self.shut_down)
         self.shutdown_btn.pack(side="right", padx=(10, 0))
 
         self.score_label = ctk.CTkLabel(self.control_frame, text="MAX SCORE:", font=self.header_font)
@@ -657,20 +863,53 @@ class LedgerGUI:
 
         self.mode_selector = ctk.CTkSegmentedButton(
             self.control_frame,
-            values=["WORKSHEET (BOXED)", "ESSAY (FULL-PAGE)"],
-            font=self.main_font,
-            height=45,
+            values=["WORKSHEET", "ESSAY"],
+            font=self.selector_font,
+            height=38,
             command=self.on_mode_selected
         )
-        self.mode_selector.set("ESSAY (FULL-PAGE)" if self.get_grading_mode() == "essay" else "WORKSHEET (BOXED)")
+        self.mode_selector.set("ESSAY" if self.get_grading_mode() == "essay" else "WORKSHEET")
         self.mode_selector.pack(side="left", padx=(0, 10))
         # [PATCH:topbar-fit] shutdown_btn moved above (packed early, side="right").
 
+        # [PATCH:batch] SCORING: LIVE | BATCH rides on its OWN row under the
+        # top row: on a 1360x768 display the top row cannot seat another
+        # control without clipping (SHUT DOWN must never clip), so the WO-B1
+        # fallback applies. The choice persists in Settings and is read once
+        # per run, exactly like MODE. The label beside it carries batch
+        # progress while a submitted job is being collected.
+        self.control_frame2 = ctk.CTkFrame(self.main_area, fg_color="transparent")
+        self.control_frame2.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+
+        self.scoring_label = ctk.CTkLabel(self.control_frame2, text="SCORING:", font=self.header_font)
+        self.scoring_label.pack(side="left", padx=(0, 10))
+
+        self.scoring_selector = ctk.CTkSegmentedButton(
+            self.control_frame2,
+            values=["LIVE", "BATCH"],
+            font=self.selector_font,
+            height=38,
+            command=self.on_scoring_selected
+        )
+        self.scoring_selector.set("BATCH" if self.get_scoring_mode() == "batch" else "LIVE")
+        self.scoring_selector.pack(side="left", padx=(0, 10))
+
+        self.batch_progress_label = ctk.CTkLabel(self.control_frame2, text="",
+                                                 font=self.main_font, anchor="w")
+        self.batch_progress_label.pack(side="left", padx=(16, 0))
+
         self.log_label = ctk.CTkLabel(self.main_area, text="DIAGNOSTIC LOG:", font=self.main_font)
-        self.log_label.grid(row=1, column=0, sticky="nw", pady=(0, 5))
+        self.log_label.grid(row=2, column=0, sticky="nw", pady=(0, 5))
 
         self.log_text = ctk.CTkTextbox(self.main_area, font=self.log_font, text_color="#2ecc71", fg_color="#121212", wrap="word", corner_radius=10)
-        self.log_text.grid(row=2, column=0, sticky="nsew")
+        self.log_text.grid(row=3, column=0, sticky="nsew")
+
+        # [PATCH:cosmetics] WO-COS1 T7: color-coded log lines. Tags live on
+        # the underlying tk widget; "[!]" errors render red, "===" section
+        # banners white bold Courier, everything else keeps the green default.
+        _log_tk = getattr(self.log_text, "_textbox", self.log_text)
+        _log_tk.tag_config("ledger_err", foreground="#e74c3c")
+        _log_tk.tag_config("ledger_hdr", foreground="#ffffff", font=self.log_font_bold)
 
         # SURGICAL INSERTION: Universal Right-Click Menu for the Diagnostic Log
         def custom_log_paste():
@@ -751,7 +990,7 @@ class LedgerGUI:
             }
             
             time.sleep(10) # Network buffer before establishing Silo 1 session
-            response = requests.post("http://127.0.0.1:5000/api/silo1", json=payload, timeout=60)
+            response = requests.post(DAEMON_BASE + "/api/silo1", json=payload, timeout=60)
             
             if response.status_code != 200:
                 raise Exception(f"Daemon HTTP {response.status_code}: {response.text}")
@@ -869,6 +1108,13 @@ class LedgerGUI:
                 INSERT OR IGNORE INTO Settings (Setting_Key, Setting_Value)
                 VALUES ('grading_mode', 'boxed')
             ''')
+
+            # 8. [PATCH:batch] Inject default scoring mode (live = today's
+            # immediate calls; batch = half-price submit-and-collect)
+            cursor.execute('''
+                INSERT OR IGNORE INTO Settings (Setting_Key, Setting_Value)
+                VALUES ('scoring_mode', 'live')
+            ''')
             
             conn.commit()
             conn.close()
@@ -909,14 +1155,14 @@ class LedgerGUI:
             self.status_label.configure(text="AWAITING SETUP", text_color="#c0392b")
             notice = ctk.CTkToplevel(self.root)
             notice.title("SYSTEM NOT YET INITIALIZED")
-            notice.geometry("560x270")
+            self._clamp_toplevel(notice, 560, 270)
             notice.transient(self.root)
             ctk.CTkLabel(notice, text="SYSTEM NOT YET INITIALIZED",
                          font=self.header_font).pack(pady=(30, 15))
             ctk.CTkLabel(
                 notice,
                 text=("This Ledger has not been set up yet.\n\n"
-                      "First-time setup runs from the owner (paragon) account.\n"
+                      "First-time setup runs from the owner (administrator) account.\n"
                       "Evaluation is unavailable until then."),
                 font=self.main_font, justify="center"
             ).pack(pady=10, padx=20)
@@ -1145,11 +1391,17 @@ class LedgerGUI:
         check_var = ctk.StringVar(value="off")
         liability_cb = ctk.CTkCheckBox(
             body,
-            text="I HAVE READ AND AGREE TO THESE TERMS. I UNDERSTAND THIS IS EXPERIMENTAL SOFTWARE FOR EVALUATION,\nPROVIDED AS IS WITH NO WARRANTY, AND I USE IT ENTIRELY AT MY OWN RISK.",
+            text="I HAVE READ AND AGREE TO THESE TERMS. I UNDERSTAND THIS IS EXPERIMENTAL SOFTWARE FOR EVALUATION, PROVIDED AS IS WITH NO WARRANTY, AND I USE IT ENTIRELY AT MY OWN RISK.",
             variable=check_var, onvalue="on", offvalue="off",
             font=ctk.CTkFont(family="Ubuntu", size=11, weight="bold"),
             text_color="#c0392b"
         )
+        # [PATCH:cosmetics] WO-COS1 T12: dynamic wrap instead of hand-placed
+        # \n breaks (probed: wrapped request 656x28 vs 745x28 manual).
+        try:
+            liability_cb._text_label.configure(wraplength=700, justify="left")
+        except Exception:
+            pass
         liability_cb.pack(pady=(10, 14))
 
         submit_btn = ctk.CTkButton(
@@ -1333,7 +1585,7 @@ class LedgerGUI:
 
                 # 2. ONE privileged step: create /etc/paragon, install .env (and
                 #    sa.json when the Vertex route is used) with daemon-readable
-                #    perms (root:paragon 0640), drop the world-readable
+                #    perms (root:<owner group> 0640), drop the world-readable
                 #    'initialized' marker, restart the daemon. A non-Vertex
                 #    install also REMOVES any stale sa.json so a re-initialized
                 #    box can't silently keep a prior Google Cloud identity.
@@ -1346,17 +1598,20 @@ class LedgerGUI:
                     # Credential install is fatal-on-error (set -e); the daemon
                     # (re)start is best-effort -- it must NOT undo a good save if
                     # the broker isn't placed yet (system map register #1).
+                    # [PATCH:owner-from-sudo-user] the daemon-readable group is the running
+                    # user's primary group, not the literal "paragon" (computed once).
+                    owner_group = grp.getgrgid(os.getgid()).gr_name
                     sa_step = (
                         f"mv '{temp_sa}' /etc/paragon/sa.json; "
-                        "chown root:paragon /etc/paragon/sa.json; chmod 640 /etc/paragon/sa.json; "
+                        f"chown root:{owner_group} /etc/paragon/sa.json; chmod 640 /etc/paragon/sa.json; "   # [PATCH:owner-from-sudo-user]
                         if use_vertex else
                         "rm -f /etc/paragon/sa.json; "
                     )
                     combined_command = (
                         "set -e; "
-                        "install -d -o root -g paragon -m 0750 /etc/paragon; "
+                        f"install -d -o root -g {owner_group} -m 0750 /etc/paragon; "   # [PATCH:owner-from-sudo-user]
                         f"mv '{temp_env}' /etc/paragon/.env; "
-                        "chown root:paragon /etc/paragon/.env; chmod 640 /etc/paragon/.env; "
+                        f"chown root:{owner_group} /etc/paragon/.env; chmod 640 /etc/paragon/.env; "   # [PATCH:owner-from-sudo-user]
                         + sa_step +
                         f"mv '{temp_marker}' /etc/ledger-initialized; "
                         "chown root:root /etc/ledger-initialized; chmod 644 /etc/ledger-initialized; "
@@ -1448,6 +1703,39 @@ class LedgerGUI:
             self.log_message(f"[!] Database Read Error (Grading Mode): {e}")
             return "boxed"
 
+    def get_scoring_mode(self):
+        """[PATCH:batch] Fetches the scoring mode from the Settings DB.
+        Returns 'live' (default and fail-safe) or 'batch'. Any unexpected
+        value collapses to 'live' so a corrupt row can never strand a run
+        in batch mode."""
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT Setting_Value FROM Settings WHERE Setting_Key = 'scoring_mode'")
+            result = cursor.fetchone()
+            conn.close()
+            return "batch" if (result and result[0] == "batch") else "live"
+        except Exception as e:
+            self.log_message(f"[!] Database Read Error (Scoring Mode): {e}")
+            return "live"
+
+    def on_scoring_selected(self, selected_value):
+        """[PATCH:batch] Persists the scoring choice immediately, like the
+        MODE selector; it is read ONCE per run in start_ledger."""
+        mode = "batch" if "BATCH" in str(selected_value).upper() else "live"
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO Settings (Setting_Key, Setting_Value)
+                VALUES ('scoring_mode', ?)
+            ''', (mode,))
+            conn.commit()
+            conn.close()
+            self.log_message(f"-> Scoring mode set to: {mode.upper()}.")
+        except Exception as e:
+            self.log_message(f"[!] Database Write Error (Scoring Mode): {e}")
+
     def get_grading_instructions(self):
         """[PATCH:no-default-prompt] WO3: the teacher's grading instructions from
         the Settings DB. Nothing ships built in: no row (fresh install) or a
@@ -1475,7 +1763,7 @@ class LedgerGUI:
             ''', (mode,))
             conn.commit()
             conn.close()
-            self.log_message(f"-> Grading mode set to: {'ESSAY (FULL-PAGE)' if mode == 'essay' else 'WORKSHEET (BOXED)'}.")
+            self.log_message(f"-> Grading mode set to: {'ESSAY' if mode == 'essay' else 'WORKSHEET'}.")
         except Exception as e:
             self.log_message(f"[!] Database Write Error (Grading Mode): {e}")
 
@@ -1619,7 +1907,7 @@ class LedgerGUI:
         meta/llama-3.1-405b-instruct-maas. Persists per-user."""
         win = ctk.CTkToplevel(self.root)
         win.title("AI MODEL")
-        win.geometry("640x460")
+        self._clamp_toplevel(win, 640, 460)
         win.minsize(620, 440)
         win.resizable(True, True)
         win.transient(self.root)
@@ -1668,10 +1956,19 @@ class LedgerGUI:
         place -- the all-users AI MODEL button (open_model_picker) -- so this
         window no longer changes the model."""
         adv_win = ctk.CTkToplevel(self.root)
-        adv_win.title("JUST DON'T!")
-        adv_win.geometry("600x340")
+        adv_win.title("ADVANCED SETTINGS")
+        self._clamp_toplevel(adv_win, 600, 430)
         adv_win.minsize(560, 300)
         adv_win.transient(self.root)
+
+        # [PATCH:keymgr] WO-APP1 T5: key management sits with the other
+        # admin-gated controls, gated like SYSTEM INITIALIZATION.
+        if self._is_initializer():
+            ctk.CTkButton(
+                adv_win, text="MANAGE API KEYS", font=self.main_font,
+                fg_color="#1f538d", hover_color="#14375e",
+                command=self.open_manage_api_keys
+            ).pack(pady=(24, 0))
 
         # The Scary Warning Frame
         warn_frame = ctk.CTkFrame(adv_win, fg_color="#c0392b", corner_radius=10)  # Blaze Red
@@ -1679,15 +1976,15 @@ class LedgerGUI:
 
         warn_label = ctk.CTkLabel(
             warn_frame,
-            text=("WARNING!\n\nFactory reset wipes this appliance's credentials\n"
-                  "and re-locks it. Everyone will know it was you.\n"
-                  "Get out of here unless you know what you're doing!"),
+            text=("WARNING\n\nResetting authorization removes this appliance's AI\n"
+                  "credentials and re-locks it until an administrator\n"
+                  "re-initializes it. Grades, rosters and settings are kept."),
             font=ctk.CTkFont(family="Ubuntu", size=16, weight="bold"),
             text_color="white"
         )
         warn_label.pack(pady=20)
 
-        # --- ADMIN-ONLY FACTORY RESET ---
+        # --- ADMIN-ONLY AUTHORIZATION RESET (function names unchanged) ---
         try:
             current_user = getpass.getuser()
             sudo_group = grp.getgrnam('sudo').gr_mem
@@ -1696,7 +1993,7 @@ class LedgerGUI:
             if current_user == 'paragon' or current_user in sudo_group:
                 reset_btn = ctk.CTkButton(
                     adv_win,
-                    text="FACTORY RESET APPLIANCE",
+                    text="RESET AUTHORIZATION",
                     font=self.main_font,
                     fg_color="#8B0000",  # Dark Red
                     hover_color="#A52A2A",
@@ -1710,7 +2007,87 @@ class LedgerGUI:
 
     def execute_factory_reset(self, window):
         """Wipes the secure .env and database liability signatures to lock the system."""
-        self.log_message("Requesting administrative privileges for Factory Reset...")
+        # [PATCH:batch] WO-B1-2 Task 7: a factory reset wipes the API keys,
+        # so a batch job still pending at the provider could afterwards be
+        # neither collected nor cancelled -- student work would sit at the
+        # provider with no record of it on this box. Say so in plain words
+        # and let the operator cancel the batch first, or back out of the reset.
+        if os.path.exists(BATCH_JOB_FILE):
+            self._factory_reset_batch_guard(window)
+            return
+        self._do_factory_reset(window)
+
+    def _factory_reset_batch_guard(self, window):
+        """[PATCH:batch] WO-B1-2 Task 7: the pending-batch dialog shown
+        instead of an immediate factory reset."""
+        try:
+            job = self._batch_job_load()
+        except Exception:
+            job = {}
+        n = sum(1 for s in (job.get("students") or {}).values()
+                if s.get("status") == "pending")
+        msg = (f"A BATCH scoring job is still waiting at the AI provider "
+               f"({n} student(s) not collected yet).\n\n"
+               "An authorization reset now would erase this machine's keys and "
+               "its record of that job -- the student work at the provider "
+               "could then be neither collected nor cancelled.\n\n"
+               "CANCEL THE BATCH FIRST cancels the job at the provider, "
+               "defers the uncollected students (their scans stay in "
+               "'02 Inbox Scans'), and then continues with the authorization "
+               "reset.\n\nBACK OUT stops the reset and leaves the batch job "
+               "waiting.")
+        win = ctk.CTkToplevel(self.root)
+        win.title("A BATCH JOB IS STILL PENDING")
+        self._clamp_toplevel(win, 780, 420)
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        ctk.CTkLabel(win, text="A BATCH JOB IS STILL PENDING",
+                     font=self.header_font).pack(pady=(24, 10))
+        ctk.CTkLabel(win, text=msg, font=self.main_font, wraplength=700,
+                     justify="left").pack(pady=8, padx=30)
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(pady=18)
+
+        def cancel_first():
+            try:
+                win.grab_release()
+                win.destroy()
+            except tk.TclError:
+                pass
+            self.log_message("-> Authorization reset: cancelling the pending "
+                             "batch at the provider first...")
+            threading.Thread(target=self._factory_reset_cancel_then_reset,
+                             args=(job, window), daemon=True).start()
+
+        def back_out():
+            try:
+                win.grab_release()
+                win.destroy()
+            except tk.TclError:
+                pass
+            self.log_message("-> Authorization reset backed out. The pending "
+                             "batch job is untouched.")
+
+        ctk.CTkButton(row, text="CANCEL THE BATCH FIRST", font=self.main_font,
+                      height=48, fg_color="#c0392b", hover_color="#e74c3c",
+                      command=cancel_first).pack(side="left", padx=12)
+        ctk.CTkButton(row, text="BACK OUT", font=self.main_font, height=48,
+                      fg_color="#1e8449", hover_color="#27ae60",
+                      command=back_out).pack(side="left", padx=12)
+        self._make_text_copyable(win)
+        win.after(200, win.grab_set)
+
+    def _factory_reset_cancel_then_reset(self, job, window):
+        """[PATCH:batch] WO-B1-2 Task 7 worker: cancel at the provider FIRST
+        (the reset is about to wipe the keys the daemon needs for that),
+        then run the reset on the UI thread."""
+        self._cancel_batch_job(job)
+        self.root.after(0, lambda: self._do_factory_reset(window))
+
+    def _do_factory_reset(self, window):
+        """The factory reset itself (split out of execute_factory_reset by
+        [PATCH:batch] WO-B1-2 Task 7; the body is unchanged)."""
+        self.log_message("Requesting administrative privileges for the authorization reset...")
         try:
             # 1. Purge the API keys securely via pkexec
             subprocess.run(['pkexec', 'sh', '-c', 'set -e; rm -f /etc/paragon/.env /etc/paragon/sa.json /etc/ledger-initialized; set +e; systemctl stop ledger-daemon.service; exit 0'], check=True)
@@ -1722,7 +2099,7 @@ class LedgerGUI:
             conn.commit()
             conn.close()
             
-            self.log_message("-> APPLIANCE RESET SUCCESSFUL. System locked.")
+            self.log_message("-> AUTHORIZATION RESET SUCCESSFUL. System locked.")
             window.destroy()
             
             # 3. Re-evaluate first-run state THROUGH the tier gate (an initializer
@@ -1732,7 +2109,356 @@ class LedgerGUI:
         except subprocess.CalledProcessError:
             self.log_message("[!] ERROR: Administrator authorization failed. Reset aborted.")
         except Exception as e:
-            self.log_message(f"[!] Database Write Error (Factory Reset): {e}")
+            self.log_message(f"[!] Database Write Error (Authorization Reset): {e}")
+    def open_manage_api_keys(self):
+        """[PATCH:keymgr] WO-APP1 T5: add, replace or clear the DIRECT-route
+        provider keys (Google AI Studio, Anthropic) without a factory reset.
+
+        Status comes from the daemon's health endpoint (the GUI cannot read
+        /etc/paragon/.env — root-owned by design). Writes follow the
+        wizard's custody pattern exactly: stage in the per-user temp dir,
+        ONE pkexec step (engine/ledger_keyenv.py) that read-modify-writes
+        /etc/paragon/.env AS ROOT preserving every untouched line verbatim,
+        sets root:<owner group> 0640, restarts ledger-daemon.service; then the
+        GUI re-polls health and says what happened in plain words. Key
+        values never touch logs, the database, or any other file. The
+        Vertex route is read-only here (managed in SYSTEM INITIALIZATION)."""
+        import shlex
+        VENV_PY = "/opt/ledger/venv/bin/python"
+        KEYENV = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "ledger_keyenv.py")
+
+        win = ctk.CTkToplevel(self.root)
+        win.title("MANAGE API KEYS")
+        self._clamp_toplevel(win, 880, 640)
+        win.minsize(820, 560)
+        win.transient(self.root)
+
+        ctk.CTkLabel(win, text="MANAGE API KEYS",
+                     font=self.header_font).pack(pady=(18, 4))
+        intro = ("Add or replace the keys the Ledger uses to reach its AI "
+                 "providers — direct routes only: a Google AI Studio key "
+                 "(starts AQ. or AIza) and an Anthropic key (starts "
+                 "sk-ant-). Saving a change asks for your password, then "
+                 "restarts the Ledger's engine. Key values are never shown "
+                 "again after they are saved.")
+        ctk.CTkLabel(win, text=intro, font=self.main_font, wraplength=780,
+                     justify="left").pack(pady=(0, 10), padx=30)
+
+        action_status = ctk.CTkLabel(win, text="", font=self.main_font,
+                                     wraplength=780, justify="left",
+                                     text_color="#e67e22")
+        st = {"health": None}
+        rows = {}
+
+        def say(text, color="#e67e22"):
+            action_status.configure(text=text, text_color=color)
+
+        def make_row(provider, title_text, placeholder):
+            frame = ctk.CTkFrame(win, corner_radius=10)
+            frame.pack(fill="x", padx=30, pady=6)
+            ctk.CTkLabel(frame, text=title_text,
+                         font=ctk.CTkFont(family="Ubuntu", size=15,
+                                          weight="bold"),
+                         anchor="w").pack(fill="x", padx=14, pady=(10, 0))
+            status = ctk.CTkLabel(frame,
+                                  text="Checking the appliance's current "
+                                       "setup...",
+                                  font=self.main_font, wraplength=760,
+                                  justify="left", anchor="w",
+                                  text_color="#7f8c8d")
+            status.pack(fill="x", padx=14, pady=(2, 6))
+            entry_row = ctk.CTkFrame(frame, fg_color="transparent")
+            entry_row.pack(fill="x", padx=14, pady=(0, 10))
+            entry = ctk.CTkEntry(entry_row, font=self.main_font, width=340,
+                                 show="•", placeholder_text=placeholder)
+            entry.pack(side="left", padx=(0, 8))
+
+            def toggle_show():
+                hidden = entry.cget("show") == "•"
+                entry.configure(show="" if hidden else "•")
+                show_btn.configure(text="HIDE" if hidden else "SHOW")
+
+            show_btn = ctk.CTkButton(entry_row, text="SHOW", width=70,
+                                     font=self.main_font, fg_color="#333333",
+                                     hover_color="#555555",
+                                     command=toggle_show)
+            show_btn.pack(side="left", padx=(0, 8))
+            save_btn = ctk.CTkButton(entry_row, text="SAVE KEY", width=105,
+                                     font=self.main_font, fg_color="#1e8449",
+                                     hover_color="#27ae60",
+                                     command=lambda: on_save(provider))
+            save_btn.pack(side="left", padx=(0, 8))
+            clear_btn = ctk.CTkButton(entry_row, text="CLEAR KEY", width=105,
+                                      font=self.main_font, fg_color="#8B0000",
+                                      hover_color="#A52A2A",
+                                      command=lambda: on_clear(provider))
+            clear_btn.pack(side="left")
+            rows[provider] = {"status": status, "entry": entry,
+                              "entry_row": entry_row, "save": save_btn,
+                              "clear": clear_btn, "show": show_btn}
+
+        make_row("google", "GOOGLE (AI STUDIO)",
+                 "Paste the new Google AI Studio key")
+        make_row("anthropic", "ANTHROPIC",
+                 "Paste the new Anthropic key (sk-ant-...)")
+
+        action_status.pack(fill="x", padx=30, pady=(4, 2))
+        btn_row = ctk.CTkFrame(win, fg_color="transparent")
+        btn_row.pack(pady=(4, 16))
+        ctk.CTkButton(btn_row, text="RE-CHECK STATUS", font=self.main_font,
+                      fg_color="#1f538d", hover_color="#14375e",
+                      command=lambda: refresh_status()).pack(side="left",
+                                                             padx=8)
+        ctk.CTkButton(btn_row, text="CLOSE", font=self.main_font,
+                      fg_color="#333333", hover_color="#555555",
+                      command=win.destroy).pack(side="left", padx=8)
+
+        def apply_health(h):
+            st["health"] = h
+            g, a = rows["google"], rows["anthropic"]
+            if h is None:
+                for r in (g, a):
+                    r["status"].configure(
+                        text="The Ledger daemon is not answering right now, "
+                             "so the current setup cannot be shown. Try "
+                             "RE-CHECK STATUS in a moment.")
+                return
+            groute = h.get("google_route")
+            aroute = h.get("anthropic_route")
+            if groute == "vertex":
+                # [PATCH:keymgr] 5f: the Vertex route is OUT OF SCOPE here.
+                g["status"].configure(
+                    text="This appliance uses your institution's Google "
+                         "Cloud (Vertex) setup for Google models. That is "
+                         "managed in SYSTEM INITIALIZATION, not here, and "
+                         "is shown for information only.")
+                g["entry_row"].pack_forget()
+            else:
+                g["entry_row"].pack(fill="x", padx=14, pady=(0, 10))
+                if groute == "developer-api":
+                    g["status"].configure(
+                        text="Configured — a direct AI Studio key is "
+                             "installed and in use.")
+                    g["clear"].configure(state="normal")
+                else:
+                    g["status"].configure(
+                        text="Not configured — no Google key on this "
+                             "appliance.")
+                    g["clear"].configure(state="disabled")
+            if aroute == "direct-api":
+                a["status"].configure(
+                    text="Configured — a direct Anthropic key is installed "
+                         "and in use.")
+                a["clear"].configure(state="normal")
+            elif aroute == "vertex":
+                a["status"].configure(
+                    text="Claude models currently run through your "
+                         "institution's Google Cloud (Vertex) setup. Adding "
+                         "a direct Anthropic key here will take over for "
+                         "Claude models.")
+                a["clear"].configure(state="disabled")
+            else:
+                a["status"].configure(
+                    text="Not configured — no Anthropic key on this "
+                         "appliance.")
+                a["clear"].configure(state="disabled")
+
+        def refresh_status():
+            def _worker():
+                try:
+                    h = requests.get(DAEMON_BASE + "/", timeout=5).json()
+                except Exception:
+                    h = None
+                self.root.after(0, lambda: apply_health(h))
+            threading.Thread(target=_worker, daemon=True).start()
+
+        def write_change(updates_lines):
+            """The ONE privileged write: wizard custody pattern."""
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            upath = os.path.join(TEMP_DIR, "keymgr-updates.temp")
+            fd = os.open(upath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(updates_lines) + "\n")
+            say("Requesting your password to secure the key change...")
+            self.log_message("Requesting your password to secure the key "
+                             "change...")   # never the value
+            cmd = ("set -e; %s %s apply %s; "
+                   "set +e; systemctl restart ledger-daemon.service; exit 0"
+                   % (shlex.quote(VENV_PY), shlex.quote(KEYENV),
+                      shlex.quote(upath)))
+            try:
+                subprocess.run(['pkexec', 'sh', '-c', cmd], check=True,
+                               capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                try:
+                    os.remove(upath)        # keyenv removes it; belt-and-braces
+                except OSError:
+                    pass
+                detail = (e.stderr or "").strip().splitlines()
+                detail = detail[-1] if detail else ""
+                say(detail or "The password prompt failed or was cancelled. "
+                              "Nothing was changed.", "#c0392b")
+                return
+            for r in rows.values():
+                r["entry"].delete(0, "end")
+            say("Change saved. Restarting the Ledger's engine and "
+                "re-checking...", "#1e8449")
+
+            def _wait_worker():
+                deadline = time.time() + 30
+                h = None
+                while time.time() < deadline and h is None:
+                    try:
+                        h = requests.get(DAEMON_BASE + "/", timeout=4).json()
+                    except Exception:
+                        time.sleep(2.0)
+
+                def _done():
+                    apply_health(h)
+                    if h is None:
+                        say("The change was saved, but the Ledger's engine "
+                            "has not come back up yet. Give it a moment, "
+                            "then press RE-CHECK STATUS.", "#e67e22")
+                    else:
+                        say("Done. The rows above show the appliance's "
+                            "current setup.", "#1e8449")
+                self.root.after(0, _done)
+            threading.Thread(target=_wait_worker, daemon=True).start()
+
+        def open_billing_confirm(key_value, warn_text):
+            """[PATCH:keymgr] 5e: adding an AI Studio key keeps the
+            initialization wizard's billing confirmation, same text."""
+            d = ctk.CTkToplevel(win)
+            d.title("Billing and Student Work — Required Reading")
+            self._clamp_toplevel(d, 920, 640)
+            d.transient(win)
+            ctk.CTkLabel(d, text="BILLING AND STUDENT WORK — REQUIRED "
+                                 "READING",
+                         font=self.header_font).pack(pady=(18, 8))
+            box = ctk.CTkTextbox(d, width=840, height=380, wrap="word",
+                                 font=ctk.CTkFont(family="Ubuntu", size=13))
+            box.pack(pady=(0, 6), padx=30)
+            box.insert("0.0", BILLING_DISCLOSURE_TEXT)
+            box.configure(state="disabled")
+            bvar = ctk.StringVar(value="off")
+            ctk.CTkCheckBox(
+                d,
+                text="I have enabled billing on this Google AI Studio key.",
+                variable=bvar, onvalue="on", offvalue="off",
+                font=ctk.CTkFont(family="Ubuntu", size=13, weight="bold"),
+                text_color="#c0392b").pack(pady=(8, 8))
+            brow = ctk.CTkFrame(d, fg_color="transparent")
+            brow.pack(pady=(0, 16))
+
+            def go():
+                if bvar.get() != "on":
+                    return
+                d.destroy()
+                if warn_text:
+                    self.log_message("[keymgr] " + warn_text)
+                write_change(['LEDGER_GOOGLE_API_KEY="%s"' % key_value])
+            ctk.CTkButton(brow, text="SAVE THIS KEY", font=self.header_font,
+                          height=44, width=220, fg_color="#1e8449",
+                          hover_color="#27ae60",
+                          command=go).pack(side="left", padx=10)
+            ctk.CTkButton(brow, text="CANCEL", font=self.header_font,
+                          height=44, width=160, fg_color="#333333",
+                          hover_color="#555555",
+                          command=d.destroy).pack(side="left", padx=10)
+            self._make_text_copyable(d)
+
+        def on_save(provider):
+            key = rows[provider]["entry"].get().strip()
+            if not key:
+                say("Paste the key first.")
+                return
+            if '"' in key or "\n" in key or "\r" in key:
+                say("That doesn't look like a key — it contains a quote or "
+                    "a line break. Check the paste.", "#c0392b")
+                return
+            if provider == "google":
+                if key.startswith(ANTHROPIC_PREFIX):
+                    say("That looks like an Anthropic key (sk-ant-...). "
+                        "Paste it in the ANTHROPIC row instead.", "#c0392b")
+                    return
+                warn = None
+                if not key.startswith(AI_STUDIO_PREFIXES):
+                    warn = ("AI Studio keys normally begin with AQ. or "
+                            "AIza — double-check the paste.")
+                    say(warn)
+                open_billing_confirm(key, warn)
+            else:
+                if key.startswith(AI_STUDIO_PREFIXES):
+                    say("That looks like a Google AI Studio key. Paste it "
+                        "in the GOOGLE (AI STUDIO) row instead.", "#c0392b")
+                    return
+                if not key.startswith(ANTHROPIC_PREFIX):
+                    say("Anthropic keys begin with sk-ant- — copy the whole "
+                        "key from the Anthropic Console.", "#c0392b")
+                    return
+                write_change(['LEDGER_ANTHROPIC_API_KEY="%s"' % key])
+
+        def on_clear(provider):
+            h = st["health"] or {}
+            groute = h.get("google_route")
+            aroute = h.get("anthropic_route")
+            # A Vertex route counts as a working provider: clearing the AI
+            # Studio key on a box that also holds a GCP project falls back
+            # to Vertex. The rewriter reads the real file and refuses a
+            # genuine last-provider clear even if this pre-check is stale.
+            other_alive = (aroute in ("direct-api", "vertex")
+                           if provider == "google"
+                           else groute in ("developer-api", "vertex"))
+            if not other_alive:
+                say("This is the appliance's only working AI provider. The "
+                    "Ledger cannot run with no provider at all — add the "
+                    "other provider's key first, then clear this one.",
+                    "#c0392b")
+                return
+            name = ("Google AI Studio" if provider == "google"
+                    else "Anthropic")
+            env_key = ("LEDGER_GOOGLE_API_KEY" if provider == "google"
+                       else "LEDGER_ANTHROPIC_API_KEY")
+            d = ctk.CTkToplevel(win)
+            d.title("CLEAR THIS KEY?")
+            self._clamp_toplevel(d, 640, 300)
+            d.transient(win)
+            ctk.CTkLabel(d, text="CLEAR THIS KEY?",
+                         font=self.header_font).pack(pady=(22, 8))
+            ctk.CTkLabel(d, text=("This removes the %s key from the "
+                                  "appliance. Models from this provider "
+                                  "will stop working until a new key is "
+                                  "added. The other provider is not "
+                                  "touched." % name),
+                         font=self.main_font, wraplength=560,
+                         justify="left").pack(pady=6, padx=30)
+            drow = ctk.CTkFrame(d, fg_color="transparent")
+            drow.pack(pady=16)
+
+            def go():
+                d.destroy()
+                write_change(["%s=" % env_key])
+            ctk.CTkButton(drow, text="CLEAR THE KEY", font=self.main_font,
+                          height=44, fg_color="#8B0000",
+                          hover_color="#A52A2A",
+                          command=go).pack(side="left", padx=10)
+            ctk.CTkButton(drow, text="KEEP IT", font=self.main_font,
+                          height=44, fg_color="#1e8449",
+                          hover_color="#27ae60",
+                          command=d.destroy).pack(side="left", padx=10)
+            self._make_text_copyable(d)
+
+        refresh_status()
+        # Test seam, same pattern as self._wizard_hooks / self._fmt_hooks.
+        self._keymgr_hooks = {"win": win, "rows": rows, "say": say,
+                              "apply_health": apply_health,
+                              "refresh_status": refresh_status,
+                              "on_save": on_save, "on_clear": on_clear,
+                              "write_change": write_change,
+                              "action_status": action_status}
+        self._make_text_copyable(win)
+
     def open_keys_and_accounts(self):
         """Launch the tier-aware Keys & Accounts GUI (ledger-keymgr-gui.py).
 
@@ -1842,11 +2568,7 @@ class LedgerGUI:
         # Treeview Configuration
         columns = ("username", "group")
         tree = ttk.Treeview(mgr_win, columns=columns, show="headings", height=8)
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", rowheight=25)
-        style.configure("Treeview.Heading", background="#1f538d", foreground="white", font=('Ubuntu', 10, 'bold'))
-        style.map('Treeview', background=[('selected', '#1e8449')])
+        self._style_dark_treeview()
 
         tree.heading("username", text="System Username")
         tree.column("username", width=400, anchor="center")
@@ -1982,7 +2704,7 @@ class LedgerGUI:
         
         # 4. Build the UI Canvas
         calib_win = ctk.CTkToplevel(self.root)
-        calib_win.title("PARAGON SCANNER CALIBRATION STUDIO")
+        calib_win.title("SCANNER CALIBRATION")
         calib_win.geometry(f"{ui_w + 40}x{target_ui_height + 120}")
         calib_win.transient(self.root)
         
@@ -2152,7 +2874,7 @@ class LedgerGUI:
         """Launches the dedicated appliance GUI for managing the SQLite Roster and FERPA Pseudonyms."""
         rost_win = ctk.CTkToplevel(self.root)
         rost_win.title("ROSTER MANAGER")
-        rost_win.geometry("1100x850") # Expanded height to fit the legal block
+        self._clamp_toplevel(rost_win, 1100, 850) # Expanded height to fit the legal block
         rost_win.transient(self.root)
         
         custom_label = self.get_custom_id_label()
@@ -2218,13 +2940,18 @@ class LedgerGUI:
         custom_label_entry.bind("<KeyRelease>", on_entry_edit)
 
         liability_cb = ctk.CTkCheckBox(
-            action_row, 
-            text="I have read the FERPA compliance statement and understand that students’ personally identifying information (PII)\nmust be pseudonymized before using The Ledger system. I accept full legal responsibility for ensuring that my chosen\nPseudonym System does not contain PII or district-issued ID numbers.",
+            action_row,
+            text="I have read the FERPA compliance statement and understand that students’ personally identifying information (PII) must be pseudonymized before using The Ledger system. I accept full legal responsibility for ensuring that my chosen Pseudonym System does not contain PII or district-issued ID numbers.",
             variable=check_var, onvalue="on", offvalue="off",
             font=ctk.CTkFont(family="Ubuntu", size=11, weight="bold"),
             text_color="white",
             command=toggle_update_btn
         )
+        # [PATCH:cosmetics] WO-COS1 T12: dynamic wrap instead of hand-placed \n breaks.
+        try:
+            liability_cb._text_label.configure(wraplength=820, justify="left")
+        except Exception:
+            pass
         liability_cb.pack(side="left", fill="x", expand=True, padx=(0, 10))
         
         def save_pseudonym():
@@ -2267,11 +2994,7 @@ class LedgerGUI:
         columns = ("b_id", "first", "last")
         tree = ttk.Treeview(rost_win, columns=columns, show="headings", height=10)
         
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", rowheight=25)
-        style.configure("Treeview.Heading", background="#1f538d", foreground="white", font=('Ubuntu', 10, 'bold'))
-        style.map('Treeview', background=[('selected', '#1e8449')])
+        self._style_dark_treeview()
         
         tree.heading("b_id", text=custom_label)
         tree.column("b_id", width=160, anchor="center")
@@ -2405,7 +3128,7 @@ class LedgerGUI:
         """Launches the dedicated appliance GUI for managing the SQLite Assignments."""
         assn_win = ctk.CTkToplevel(self.root)
         assn_win.title("ASSIGNMENT MANAGER")
-        assn_win.geometry("800x500")
+        self._clamp_toplevel(assn_win, 800, 500)
         assn_win.transient(self.root)
 
         header_label = ctk.CTkLabel(assn_win, text="ASSIGNMENT MANAGEMENT", font=self.header_font)
@@ -2415,11 +3138,7 @@ class LedgerGUI:
         columns = ("a_key", "title", "max_score")
         tree = ttk.Treeview(assn_win, columns=columns, show="headings", height=8)
 
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", rowheight=25)
-        style.configure("Treeview.Heading", background="#1f538d", foreground="white", font=('Ubuntu', 10, 'bold'))
-        style.map('Treeview', background=[('selected', '#1e8449')])
+        self._style_dark_treeview()
 
         tree.heading("a_key", text="System Key")
         tree.column("a_key", width=0, stretch=False) # Hides internal key from user
@@ -2536,7 +3255,7 @@ class LedgerGUI:
         """Launches the GRADING INSTRUCTIONS editor (the teacher's prompt)."""
         editor_win = ctk.CTkToplevel(self.root)
         editor_win.title("GRADING INSTRUCTIONS")
-        editor_win.geometry("900x700")
+        self._clamp_toplevel(editor_win, 900, 700)
         editor_win.transient(self.root) 
         
         # Grid Configuration (Weight shifted to row 2)
@@ -2625,7 +3344,7 @@ class LedgerGUI:
         """Launches the Visual SIS interface and populates it from SQLite."""
         gb_win = ctk.CTkToplevel(self.root)
         gb_win.title("MASTER GRADEBOOK")
-        gb_win.geometry("1000x600")
+        self._clamp_toplevel(gb_win, 1000, 600)
         gb_win.transient(self.root) # Keeps window on top
         
         ctrl_frame = ctk.CTkFrame(gb_win, fg_color="transparent")
@@ -2655,16 +3374,23 @@ class LedgerGUI:
             grades_dict[b_id][a_key] = score
             
         # Build the Treeview Spreadsheet
+        # [PATCH:cosmetics] WO-COS1 T13: the tree lives in its own frame with
+        # vertical AND horizontal scrollbars, so a semester with many
+        # assignments (or many students) stays reachable.
+        tree_frame = ctk.CTkFrame(gb_win, fg_color="transparent")
+        tree_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
         columns = ["b_id", "last", "first"] + [a[0] for a in assignments]
-        tree = ttk.Treeview(gb_win, columns=columns, show="headings")
-        
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
+
         # Style the Treeview for a dark theme
-        style = ttk.Style()
-        style.theme_use("default")
-        style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", rowheight=25)
-        style.configure("Treeview.Heading", background="#1f538d", foreground="white", font=('Ubuntu', 10, 'bold'))
-        style.map('Treeview', background=[('selected', '#1e8449')])
-        
+        style = self._style_dark_treeview()
+        for _sbs in ("Ledger.Vertical.TScrollbar", "Ledger.Horizontal.TScrollbar"):
+            style.configure(_sbs, background="#333333", troughcolor="#1a1a1a",
+                            bordercolor="#1a1a1a", arrowcolor="#bbbbbb")
+            style.map(_sbs, background=[('active', '#555555')])
+
         custom_label = self.get_custom_id_label()
         tree.heading("b_id", text=custom_label)
         tree.column("b_id", width=120, anchor="center")
@@ -2676,7 +3402,9 @@ class LedgerGUI:
         assignments_map = {"Select Assignment...": None}
         for a_key, title, max_val in assignments:
             tree.heading(a_key, text=f"{title} ({format_score(max_val)})")  # [PATCH:score-format]
-            tree.column(a_key, width=150, anchor="center")
+            # stretch=False keeps each assignment column readable at 150 px;
+            # extra columns scroll horizontally instead of squeezing.
+            tree.column(a_key, width=150, anchor="center", stretch=False)
             assignments_map[title] = a_key
             
         for stu in students:
@@ -2687,9 +3415,16 @@ class LedgerGUI:
                 score = grades_dict.get(b_id, {}).get(a_key, "-")
                 row_data.append(format_score(score))  # [PATCH:score-format] display only
             tree.insert("", "end", values=row_data)
-            
-        tree.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview,
+                            style="Ledger.Vertical.TScrollbar")
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview,
+                            style="Ledger.Horizontal.TScrollbar")
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
         # --- SIS Export Controls ---
         export_label = ctk.CTkLabel(ctrl_frame, text="SIS Export:", font=self.main_font)
         export_label.pack(side="left", padx=(0, 10))
@@ -2786,13 +3521,18 @@ class LedgerGUI:
                 confirm_btn.configure(state="disabled", fg_color="#333333")
 
         liability_cb = ctk.CTkCheckBox(
-            warn_win, 
-            text="I UNDERSTAND THE LIMITATIONS OF THIS AI SYSTEM. I HAVE INDEPENDENTLY VERIFIED\nTHE ACCURACY OF THESE SCORES AND ASSUME FULL LIABILITY FOR EXPORTING THEM.",
+            warn_win,
+            text="I UNDERSTAND THE LIMITATIONS OF THIS AI SYSTEM. I HAVE INDEPENDENTLY VERIFIED THE ACCURACY OF THESE SCORES AND ASSUME FULL LIABILITY FOR EXPORTING THEM.",
             variable=check_var, onvalue="on", offvalue="off",
             font=ctk.CTkFont(family="Ubuntu", size=12, weight="bold"),
             text_color="white",
             command=toggle_export_btn
         )
+        # [PATCH:cosmetics] WO-COS1 T12: dynamic wrap instead of hand-placed \n breaks.
+        try:
+            liability_cb._text_label.configure(wraplength=760, justify="left")
+        except Exception:
+            pass
         liability_cb.pack(pady=(10, 25))
 
         confirm_btn = ctk.CTkButton(
@@ -2822,7 +3562,17 @@ class LedgerGUI:
         self.root.after(0, self._append_to_gui, message)
         
     def _append_to_gui(self, message):
-        self.log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n")
+        # [PATCH:cosmetics] WO-COS1 T7: pick the tag from the MESSAGE prefix
+        # (the timestamp is prepended after the decision, so it shares the
+        # line's color). No tag = the textbox's green default.
+        msg = str(message)
+        if msg.startswith("[!]"):
+            tags = ("ledger_err",)
+        elif msg.startswith("==="):
+            tags = ("ledger_hdr",)
+        else:
+            tags = ()
+        self.log_text.insert("end", f"[{time.strftime('%H:%M:%S')}] {message}\n", tags)
         self.log_text.see("end")
 
     # ==========================================================================
@@ -2978,6 +3728,30 @@ class LedgerGUI:
         except Exception:
             pass
 
+    def _clamp_toplevel(self, window, width, height):
+        """[PATCH:cosmetics] WO-COS1 T11: size a Toplevel to the requested
+        geometry, clamped to the physical screen the same way the dashboard
+        and wizard already are (WIZARD_SCREEN_ALLOWANCE below the screen
+        height, 40 px inside its width), so popups never clip on the
+        1360x768 target display."""
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            window.geometry(f"{min(width, sw - 40)}x{min(height, sh - WIZARD_SCREEN_ALLOWANCE)}")
+        except Exception:
+            window.geometry(f"{width}x{height}")
+
+    def _style_dark_treeview(self):
+        """[PATCH:cosmetics] WO-COS1 T14: the ONE dark ttk Treeview style,
+        formerly repeated verbatim in the roster, gradebook, assignment and
+        user manager windows. Pixel-identical to those inline blocks."""
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("Treeview", background="#2b2b2b", foreground="white", fieldbackground="#2b2b2b", rowheight=25)
+        style.configure("Treeview.Heading", background="#1f538d", foreground="white", font=('Ubuntu', 10, 'bold'))
+        style.map('Treeview', background=[('selected', '#1e8449')])
+        return style
+
     def _raise_daemon_error(self, response):
         """[PATCH:error-passthrough] The broker daemon wraps EVERY upstream
         failure as HTTP 500 + {"status":"error","message": <real reason>}.
@@ -3028,7 +3802,7 @@ class LedgerGUI:
             return (
                 "The Google AI Studio key on this machine was rejected by Google "
                 "(API_KEY_INVALID). Re-check the key in Google AI Studio, then "
-                "ADVANCED -> FACTORY RESET and re-initialize with the correct key. "
+                "ADVANCED -> RESET AUTHORIZATION and re-initialize with the correct key. "
                 "(Code 400 - Key Rejected)"
             )
 
@@ -3054,8 +3828,8 @@ class LedgerGUI:
 
         elif "500" in error_str or "internal server error" in error_str:
             return (
-                "Brief network interruption. Resubmitting document automatically. "
-                "(Code 500 - Connection Paused)"
+                "The AI provider had a brief internal error. Retrying "
+                "automatically. (Code 500 - Provider Error)"
             )
             
         elif "403" in error_str or "permission denied" in error_str:
@@ -3066,8 +3840,8 @@ class LedgerGUI:
             
         elif "400" in error_str or "bad request" in error_str:
             return (
-                "Document format is ambiguous. Re-centering for a cleaner pass. "
-                "(Code 400 - Format Adjustment)"
+                "The provider rejected the request's format. "
+                "(Code 400 - Request Rejected)"
             )
             
         else:
@@ -3124,6 +3898,32 @@ class LedgerGUI:
             self.log_message(f"[!] {NO_INSTRUCTIONS_LOG}")
             return
 
+        # [PATCH:batch] ONE pending job at a time: while a submitted batch job
+        # is waiting to be collected, RUN refuses in BOTH modes -- the pending
+        # job's scans are still in the inbox, and a second run would score
+        # them twice. The system stays idle.
+        if os.path.exists(BATCH_JOB_FILE):
+            self.status_label.configure(text="BATCH JOB PENDING", text_color="#c0392b")
+            self.log_message("[!] A submitted batch job is still pending. RUN is "
+                             "unavailable until it is resumed and collected (or "
+                             "cancelled) -- restart The Ledger to get the "
+                             "RESUME / CANCEL BATCH choice.")
+            return
+
+        # [PATCH:batch] Read the scoring choice ONCE per run, like the mode.
+        self.scoring_mode = self.get_scoring_mode()
+        if self.scoring_mode == "batch":
+            cap_ok, cap_note = self._batch_capability_check(self.get_silo2_model())
+            if not cap_ok:
+                # Refuse loudly; never silently fall back to live.
+                self.status_label.configure(text="BATCH UNAVAILABLE", text_color="#c0392b")
+                self.log_message(f"[!] BATCH scoring is unavailable: {cap_note} "
+                                 "The system stays idle; switch SCORING to LIVE "
+                                 "to score now.")
+                return
+            if cap_note:
+                self.log_message(f"-> Batch note: {cap_note}")
+
         max_score_str = self.max_score_entry.get().strip()
         if not max_score_str.isdigit() or int(max_score_str) <= 0:
             self.log_message("[!] Error: Enter a valid Max Score.")
@@ -3139,7 +3939,27 @@ class LedgerGUI:
         # tap on the selector can never change strategy under a running job.
         self.grading_mode = self.get_grading_mode()
         self.log_message(f"Pipeline mode for this run: "
-                         f"{'ESSAY (FULL-PAGE)' if self.grading_mode == 'essay' else 'WORKSHEET (BOXED)'}.")
+                         f"{'ESSAY' if self.grading_mode == 'essay' else 'WORKSHEET'}.")
+
+        # [PATCH:count-check] learned omission patterns live for ONE run;
+        # every RUN starts with a clean slate.
+        self._count_check_learned = {}
+
+        # [PATCH:box-map] answer-box notices and page shift/scale estimates
+        # live for ONE run too.
+        self._box_map_notices = []
+        self._box_map_page_stats = []
+
+        # [PATCH:footer-reader] WO-COS2 T3: footer counters live for ONE run.
+        self._footers_attempted = 0
+        self._footers_read = 0
+
+        # [PATCH:auto-orient] WO-COS2 T4: orientation counters, per run.
+        self._pages_turned_upright = 0
+        self._sideways_pages = 0
+
+        # [PATCH:pass1-pacing] WO-COS2 T5: pacing flag + re-read notices.
+        self._reset_pass1_run_state()
 
         # [PATCH:essay-tag-quiet] The corner-tag OCR exists ONLY to group
         # pages into essays for CHUNKED packing (LEDGER_ESSAY_MAX_PAGES_PER_CALL
@@ -3163,6 +3983,7 @@ class LedgerGUI:
             self.run_btn.configure(state="disabled")
             self.max_score_entry.configure(state="disabled")
             self.mode_selector.configure(state="disabled")
+            self.scoring_selector.configure(state="disabled")   # [PATCH:batch]
             self.master_btn.configure(state="disabled")
             self.update_indicator("running")
             
@@ -3184,9 +4005,18 @@ class LedgerGUI:
         self.run_btn.configure(state="normal")
         self.max_score_entry.configure(state="normal")
         self.mode_selector.configure(state="normal")   # [PATCH:essay-mode]
+        self.scoring_selector.configure(state="normal")   # [PATCH:batch]
         self.master_btn.configure(state="normal")
         self.clean_temp_directory()
-        self.log_message("Shut Down initiated. Temp folder scrubbed. System is Idle.")
+        self.log_message("Stop requested. Temp folder scrubbed. System is Idle.")
+        # [PATCH:batch] SHUT DOWN during a pending job stops the polling and
+        # nothing else: the job record lives OUTSIDE the temp folder and the
+        # provider keeps working. Nothing paid is lost.
+        if os.path.exists(BATCH_JOB_FILE):
+            self.batch_progress_label.configure(text="")
+            self.log_message("A submitted batch job is still pending. It was NOT "
+                             "cancelled; reopen The Ledger and choose RESUME to "
+                             "collect it.")
 
     def image_to_base64_png(self, image_path):
         buffer = io.BytesIO()
@@ -3215,9 +4045,39 @@ class LedgerGUI:
                 self.s2ctx_master_files.append(temp_master_path)
                 master_parts_b64.append(self.image_to_base64_png(temp_master_path))
             doc.close()
+            # [PATCH:run-summary] WO-COS2 T6: the master's page count in its
+            # OWN attribute, captured when the master is rendered --
+            # s2ctx_master_files is emptied when per-chunk context is off.
+            self._master_page_count = len(self.s2ctx_master_files)
         except Exception as e:
             self.log_message(f"[!] Failed to render Master PDF images: {e}")
             return False
+
+        # [PATCH:box-map] Master box map: run the SAME box finder over each
+        # rendered master page so Pass 1 can notice when a scan box the
+        # finder missed exists on the master, and recover it from the
+        # master's layout. Stored in its OWN attribute (with the file paths)
+        # because s2ctx_master_files is emptied when per-chunk context is
+        # off. Local OpenCV only; no AI call. LEDGER_BOX_MAP=0 skips the map
+        # entirely, which also disables all matching and recovery downstream.
+        self._box_map = {}
+        self._box_map_page_stats = []
+        if (os.environ.get("LEDGER_BOX_MAP", "1") != "0"
+                and getattr(self, "grading_mode", "boxed") != "essay"):
+            try:
+                for i, mp in enumerate(list(self.s2ctx_master_files)):
+                    mimg = cv2.imread(mp)
+                    rects = self._box_map_find_rects(mimg)
+                    self._box_map[i] = {"rects": rects,
+                                        "size": (mimg.shape[1], mimg.shape[0]),
+                                        "file": mp}
+                _n_boxes = sum(len(v["rects"]) for v in self._box_map.values())
+                self.log_message(f"-> Master box map: {_n_boxes} answer box(es) "
+                                 f"across {len(self._box_map)} master page(s).")
+            except Exception as e:
+                self._box_map = {}
+                self.log_message(f"[!] Master box map could not be built ({e}); "
+                                 "box recovery is off for this run.")
 
         self.log_message("Uploading Context Cache via Root Daemon...")
         try:
@@ -3235,11 +4095,29 @@ class LedgerGUI:
             }
             
             time.sleep(10) # Network buffer before uploading massive cache payload
-            response = requests.post("http://127.0.0.1:5000/api/cache/build", json=payload, timeout=120)
+            response = requests.post(DAEMON_BASE + "/api/cache/build", json=payload, timeout=120)
             self._raise_daemon_error(response)
-            
+
             self.cached_silo2_content = True # Just a local flag now
-            self.log_message("-> Context Cache successfully established! Valid for 12 hours.")
+            # [PATCH:cosmetics] WO-COS1 T2: the success line names what the
+            # daemon actually did ({"text": <route>}), instead of always
+            # claiming a 12-hour Google cache. GUI wording only; no payload
+            # or daemon change.
+            try:
+                _cache_route = (response.json() or {}).get("text", "")
+            except Exception:
+                _cache_route = ""
+            if _cache_route == "anthropic-local":
+                self.log_message("-> Evaluation context staged (Anthropic prompt cache — refreshed on each call).")
+            elif _cache_route == "google-inline":
+                # [PATCH:cosmetics] WO-BM3 T4: the daemon returns the SAME
+                # "google-inline" sentinel for two causes -- a master below
+                # the Google cache minimum, or a model (e.g. Gemini 4
+                # Argon) with no explicit cache at all. Name both
+                # truthfully instead of always claiming the first.
+                self.log_message("-> Evaluation context staged inline (no Google server-side cache for this model or master — the daemon log names the reason).")
+            else:
+                self.log_message("-> Google context cache built — valid for 12 hours.")
             # [PATCH:silo2-per-chunk-context] Dashboard status + daemon capability
             # gate. An older daemon would silently IGNORE master_images_b64 (grades
             # still correct, but full-weight) -- gate it OFF loudly here instead,
@@ -3249,7 +4127,7 @@ class LedgerGUI:
                 self.s2ctx_master_files = []
             else:
                 try:
-                    _health = requests.get("http://127.0.0.1:5000/", timeout=10).json()
+                    _health = requests.get(DAEMON_BASE + "/", timeout=10).json()
                 except Exception:
                     _health = {}
                 if _health.get("per_chunk_context"):
@@ -3259,75 +4137,88 @@ class LedgerGUI:
                     self.s2ctx_master_files = []
             return True
         except Exception as e:
-            self.log_message(f"[!] Failed to build Google context cache via Daemon: {e}")
+            self.log_message(f"[!] Failed to build the evaluation context via the daemon: {e}")
             return False
 
     def delete_cache(self):
         try:
-            requests.post("http://127.0.0.1:5000/api/cache/delete", timeout=15)
+            requests.post(DAEMON_BASE + "/api/cache/delete", timeout=15)
             self.cached_silo2_content = False
-            self.log_message("-> Google context cache successfully purged.")
+            self.log_message("-> Evaluation context cleared.")
         except Exception as e:
             self.log_message(f"[!] Failed to delete cache via Daemon: {e}")
      
     # ==========================================
     # SURGERY AREA 2: OPENCV BOX EXTRACTION (GEOMETRY UPGRADE)
     # ==========================================
+    def _box_map_find_rects(self, img):
+        """[PATCH:box-map] The contour-finding half of extract_boxes_with_opencv,
+        moved verbatim (same thresholds, filters and sort) so the SAME finder
+        can also map the master's answer boxes. Takes a BGR image, returns the
+        sorted list of (x, y, w, h). Any change here changes both sides."""
+        # 1. Read image in grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 2. Adaptive Thresholding: Dynamically handles scanner shadows/gradients
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV, 51, 15
+        )
+
+        # 3. Morphological Close: Leverages your 0.04" line thickness to fuse
+        # borders into unbroken solid shapes, making them mathematically perfect.
+        kernel = np.ones((5,5), np.uint8)
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+        # 4. Find Contours
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # 5. The Geometry & Extent Filter
+        valid_boxes = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+
+            # Filter 1: Dust filter (No maximum size limit)
+            if area > 10000:
+                perimeter = cv2.arcLength(cnt, True)
+                # Smoothed from 0.02 to 0.03 to ignore minor handwriting bumps
+                approx = cv2.approxPolyDP(cnt, 0.03 * perimeter, True)
+
+               # Filter 2: Allow up to 15 corners to accommodate handwriting bumps/tails.
+                if 4 <= len(approx) <= 15:
+                    x, y, w, h = cv2.boundingRect(approx)
+                    rect_area = w * h
+
+                    # Filter 3: The Height Check (The Paragraph Assassin)
+                    # Rejects fused text strings and rogue equations (usually < 50px tall)
+                    if h > 75:
+
+                        # Filter 4: The Extent Check
+                        # Lowered to 0.65 to allow students' handwriting to cross box boundaries.
+                        extent = float(area) / rect_area
+                        if extent > 0.65:
+                            valid_boxes.append((x, y, w, h))
+
+        # 6. Spatial Sorting Math (Top-to-Bottom, Left-to-Right)
+        def get_sort_key(box):
+            x, y, w, h = box
+            return (y // 150, x)
+
+        valid_boxes.sort(key=get_sort_key)
+        return valid_boxes
+
     def extract_boxes_with_opencv(self, full_page_img_path, page_num):
         """Finds LibreOffice boxes using adaptive thresholding, strict geometry, and extent."""
         snippets = []
+        # [PATCH:box-map] remember this page's rectangles and size so Pass 1
+        # can match them against the master's box map; None = finder errored.
+        self._box_map_last = None
         try:
-            # 1. Read image in grayscale
             img = cv2.imread(full_page_img_path)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            
-            # 2. Adaptive Thresholding: Dynamically handles scanner shadows/gradients
-            thresh = cv2.adaptiveThreshold(
-                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY_INV, 51, 15
-            )
-            
-            # 3. Morphological Close: Leverages your 0.04" line thickness to fuse 
-            # borders into unbroken solid shapes, making them mathematically perfect.
-            kernel = np.ones((5,5), np.uint8)
-            closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-            
-            # 4. Find Contours
-            contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # 5. The Geometry & Extent Filter
-            valid_boxes = []
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                
-                # Filter 1: Dust filter (No maximum size limit)
-                if area > 10000:
-                    perimeter = cv2.arcLength(cnt, True)
-                    # Smoothed from 0.02 to 0.03 to ignore minor handwriting bumps
-                    approx = cv2.approxPolyDP(cnt, 0.03 * perimeter, True)
-                    
-                   # Filter 2: Allow up to 15 corners to accommodate handwriting bumps/tails.
-                    if 4 <= len(approx) <= 15:
-                        x, y, w, h = cv2.boundingRect(approx)
-                        rect_area = w * h
-                        
-                        # Filter 3: The Height Check (The Paragraph Assassin)
-                        # Rejects fused text strings and rogue equations (usually < 50px tall)
-                        if h > 75:
-                            
-                            # Filter 4: The Extent Check
-                            # Lowered to 0.65 to allow students' handwriting to cross box boundaries.
-                            extent = float(area) / rect_area
-                            if extent > 0.65:
-                                valid_boxes.append((x, y, w, h))
-            
-            # 6. Spatial Sorting Math (Top-to-Bottom, Left-to-Right)
-            def get_sort_key(box):
-                x, y, w, h = box
-                return (y // 150, x)
-            
-            valid_boxes.sort(key=get_sort_key)
-            
+            valid_boxes = self._box_map_find_rects(img)
+            self._box_map_last = {"rects": list(valid_boxes),
+                                  "size": (img.shape[1], img.shape[0])}
+
             # 7. Crop and Save
             box_count = 0
             for x, y, w, h in valid_boxes:
@@ -3343,7 +4234,1112 @@ class LedgerGUI:
         except Exception as e:
             self.log_message(f"[!] OpenCV Error on {full_page_img_path}: {e}")
             return []
-    
+
+    # ==========================================
+    # [PATCH:box-map] WO-B1-4: MASTER BOX MAP, MATCH AND RECOVERY
+    # A faint scanner line can fuse with a box border into one contour that
+    # the extent filter rejects -- the box silently vanishes and the count
+    # check cannot see it (it compares reply items with boxes SENT). The map
+    # of the MASTER's boxes says how many boxes each page must have and
+    # where; a missing one is re-cropped from the master's rectangle and
+    # verified before use. Boxed mode only. LEDGER_BOX_MAP=0 turns all of
+    # this off; matched-clean pages take the untouched byte-identical path.
+    # ==========================================
+    def _box_map_record_notice(self, line):
+        """Log a teacher-facing notice now AND keep it for the end-of-run
+        summary (repeated after the closing lines, LIVE and BATCH)."""
+        self.log_message(f"  -> [BOX MAP] {line}")
+        if not hasattr(self, "_box_map_notices"):
+            self._box_map_notices = []
+        self._box_map_notices.append(line)
+
+    def _box_map_save_reject(self, crop, b_id, footer_num, box_no, detail):
+        """[PATCH:box-rejects] WO-BM1 T5: keep a REJECTED recovery crop so
+        the rejection can be diagnosed afterward (the Footer-Rejects
+        pattern: emptied at the start of Pass 1, kept until the next run).
+        LEDGER_BOX_DEBUG=0 disables the saving only; logging stays."""
+        if os.environ.get("LEDGER_BOX_DEBUG", "1") == "0":
+            return
+        try:
+            m = re.search(r"frame ([0-9.]+|n/a), tag ([0-9.]+|n/a)", detail)
+            f_s = (m.group(1) if m else "na").replace("n/a", "na")
+            t_s = (m.group(2) if m else "na").replace("n/a", "na")
+            os.makedirs(BOX_REJECTS_DIR, exist_ok=True)
+            dest = os.path.join(
+                BOX_REJECTS_DIR,
+                f"ID{b_id}-page{footer_num}-box{box_no}"
+                f"-frame{f_s}-tag{t_s}.png")
+            if crop is not None and getattr(crop, "size", 0):
+                cv2.imwrite(dest, crop)
+                self._box_rejects_saved = \
+                    getattr(self, "_box_rejects_saved", 0) + 1
+        except Exception as e:
+            self.log_message(f"    -> [!] Could not save box reject crop: {e}")
+
+    def _id_save_reject(self, temp_id_path, pdf_file, page_display, read_id):
+        """[PATCH:box-rejects] WO-BM1 T5: keep the ID crop of a page
+        discarded for an off-roster ID (after the re-read). The crop shows
+        the handwritten ID number only -- no names. LEDGER_BOX_DEBUG=0
+        disables the saving only."""
+        if os.environ.get("LEDGER_BOX_DEBUG", "1") == "0":
+            return
+        try:
+            os.makedirs(ID_REJECTS_DIR, exist_ok=True)
+            dest = os.path.join(
+                ID_REJECTS_DIR,
+                f"{pdf_file}-page{page_display}-read{read_id}.png")
+            if os.path.exists(temp_id_path):
+                shutil.copy(temp_id_path, dest)
+                self._id_rejects_saved = \
+                    getattr(self, "_id_rejects_saved", 0) + 1
+        except Exception as e:
+            self.log_message(f"    -> [!] Could not save ID reject crop: {e}")
+
+    @staticmethod
+    def _box_map_median(vals):
+        s = sorted(vals)
+        n = len(s)
+        if not n:
+            return 0.0
+        mid = n // 2
+        return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+    def _box_map_verify(self, scan_crop_gray, master_crop_gray, margin=0):
+        """Does this crop show the SAME printed structure as the master's box?
+        Two tests, both blind to handwriting:
+        1. FRAME: binarize both; ask what fraction of the master's printed
+           border-band pixels are also dark in the (dilated) scan. Extra ink
+           from handwriting can only ADD dark pixels, so writing across the
+           border never lowers this score; a crop in the wrong place has its
+           frame elsewhere and scores low.
+        2. TAG: the only printed ink INSIDE a master box is its tag number.
+           Template-match that tag region in the scan crop; a crop of the
+           wrong spot (or the wrong box) does not contain this exact tag.
+        Returns (ok, detail_string). Thresholds set from the WO-B1-4 tests.
+        [PATCH:tag-recovery] WO-BM1 T3: the measurements now live in
+        _box_map_scores; this wrapper applies the ORIGINAL two-test gate
+        with the original +/-20px tag window, behavior-identically (it is
+        the LEDGER_BOX_RECOVER_TAG=0 path and the no-tag fallback)."""
+        fr, tag, _dx, _dy, err = self._box_map_scores(
+            scan_crop_gray, master_crop_gray, margin=margin, win=20)
+        if err:
+            return False, err
+        # Thresholds measured in tests/test_box_map.py: the right box
+        # scores tag >= 0.89 even rotated+blurred; the NEIGHBOR box
+        # (same frame, different printed tag) peaks at 0.62. 0.75
+        # separates them with margin on both sides; frame 0.80 rejects
+        # off-box crops (<= 0.07 on blank paper).
+        ok = fr >= 0.80 and (tag is None or tag >= 0.75)
+        detail = (f"frame {fr:.2f}, tag "
+                  f"{'n/a' if tag is None else format(tag, '.2f')}")
+        return ok, detail
+
+    def _box_map_scores(self, scan_crop_gray, master_crop_gray, margin=0,
+                        win=20):
+        """[PATCH:tag-recovery] WO-BM1 T3: the frame/tag measurements behind
+        _box_map_verify, with the tag template search window as a parameter
+        and the tag's measured position offset returned. Returns
+        (frame_recall, tag_score, tag_dx, tag_dy, err): tag_dx/tag_dy are
+        the tag's measured offset from its expected spot, in master-crop
+        pixels (the scan crop is resized to the master crop before
+        matching); err is a reason string when nothing could be measured,
+        else None. With win=20 the measurements are exactly the old ones."""
+        try:
+            mh, mw = master_crop_gray.shape[:2]
+            if mh < 20 or mw < 20 or scan_crop_gray.size == 0:
+                return None, None, None, None, "degenerate crop"
+            scan = cv2.resize(scan_crop_gray, (mw, mh),
+                              interpolation=cv2.INTER_AREA)
+            _, mbin = cv2.threshold(master_crop_gray, 0, 255,
+                                    cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            _, sbin = cv2.threshold(scan, 0, 255,
+                                    cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            sfat = cv2.dilate(sbin, np.ones((11, 11), np.uint8))
+            # both crops carry `margin` px of page around the box, so the
+            # printed frame sits ~margin px inside the edge: the band must
+            # reach past it (margin + border thickness + slack).
+            band = int(margin) + max(16, int(round(0.08 * min(mw, mh))))
+            band = min(band, (min(mw, mh) - 4) // 2)
+            frame = np.zeros((mh, mw), dtype=bool)
+            frame[:band, :] = True
+            frame[-band:, :] = True
+            frame[:, :band] = True
+            frame[:, -band:] = True
+            fm = (mbin > 0) & frame
+            denom = int(fm.sum())
+            if denom < 100:
+                return None, None, None, None, "master crop shows no printed frame"
+            frame_recall = float(((sfat > 0) & fm).sum()) / denom
+
+            tag_score = None
+            tag_dx = None
+            tag_dy = None
+            inner = mbin.copy()
+            inner[frame] = 0
+            ys, xs = np.nonzero(inner)
+            if len(xs) >= 30:
+                pad = 6
+                tx0 = max(0, int(xs.min()) - pad)
+                tx1 = min(mw, int(xs.max()) + pad)
+                ty0 = max(0, int(ys.min()) - pad)
+                ty1 = min(mh, int(ys.max()) + pad)
+                tmpl = master_crop_gray[ty0:ty1, tx0:tx1]
+                sx0 = max(0, tx0 - win)
+                sx1 = min(mw, tx1 + win)
+                sy0 = max(0, ty0 - win)
+                sy1 = min(mh, ty1 + win)
+                search = scan[sy0:sy1, sx0:sx1]
+                if (search.shape[0] >= tmpl.shape[0]
+                        and search.shape[1] >= tmpl.shape[1]
+                        and tmpl.size > 0):
+                    res = cv2.matchTemplate(search, tmpl,
+                                            cv2.TM_CCOEFF_NORMED)
+                    tag_score = float(res.max())
+                    _, _, _, maxloc = cv2.minMaxLoc(res)
+                    # measured tag position minus its expected position,
+                    # in master-crop pixels
+                    tag_dx = (sx0 + maxloc[0]) - tx0
+                    tag_dy = (sy0 + maxloc[1]) - ty0
+            return frame_recall, tag_score, tag_dx, tag_dy, None
+        except Exception as e:
+            return None, None, None, None, f"verification error: {e}"
+
+    def _box_map_master_tag(self, mgray, rect):
+        """[PATCH:tag-fit] WO-BM2 T2: the printed tag of a master box, as a
+        template plus its PAGE position. The tag is the only printed ink
+        inside the box (the same region _box_map_scores matches); it sits
+        at the box's top-left corner. Returns (template, tag_x, tag_y) in
+        master-page pixels, or None when the box has no tag ink."""
+        try:
+            mx, my, mw, mh = rect
+            crop = mgray[my:my + mh, mx:mx + mw]
+            if crop.shape[0] < 20 or crop.shape[1] < 20:
+                return None
+            _, mbin = cv2.threshold(crop, 0, 255,
+                                    cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            band = max(16, int(round(0.08 * min(mw, mh))))
+            band = min(band, (min(mw, mh) - 4) // 2)
+            frame = np.zeros((mh, mw), dtype=bool)
+            frame[:band, :] = True
+            frame[-band:, :] = True
+            frame[:, :band] = True
+            frame[:, -band:] = True
+            inner = mbin.copy()
+            inner[frame] = 0
+            ys, xs = np.nonzero(inner)
+            if len(xs) < 30:
+                return None
+            pad = 6
+            tx0 = max(0, int(xs.min()) - pad)
+            tx1 = min(mw, int(xs.max()) + pad)
+            ty0 = max(0, int(ys.min()) - pad)
+            ty1 = min(mh, int(ys.max()) + pad)
+            tmpl = crop[ty0:ty1, tx0:tx1]
+            if tmpl.size == 0:
+                return None
+            return tmpl, mx + tx0, my + ty0
+        except Exception:
+            return None
+
+    def _box_map_find_tag_on_page(self, gray, tmpl, ex, ey, win, a, b):
+        """[PATCH:page-tag] WO-BM2 T2: template-match a master tag on the
+        FULL scan page, in a region of +/-win page pixels around its
+        expected top-left (ex, ey). The template is resized by the page's
+        scale (a, b). Returns (x, y, score) of the best match's top-left
+        in scan-page pixels, or None when the region cannot be searched.
+        Handwriting cannot move printed ink, so the tag is searched on the
+        page itself -- never only inside a crop that may have missed it."""
+        try:
+            th, tw = tmpl.shape[:2]
+            tws = max(1, int(round(tw * a)))
+            ths = max(1, int(round(th * b)))
+            t = cv2.resize(tmpl, (tws, ths), interpolation=cv2.INTER_AREA)
+            x0 = max(0, int(round(ex)) - win)
+            y0 = max(0, int(round(ey)) - win)
+            x1 = min(gray.shape[1], int(round(ex)) + tws + win)
+            y1 = min(gray.shape[0], int(round(ey)) + ths + win)
+            search = gray[y0:y1, x0:x1]
+            if (search.shape[0] < ths or search.shape[1] < tws
+                    or t.size == 0):
+                return None
+            res = cv2.matchTemplate(search, t, cv2.TM_CCOEFF_NORMED)
+            _, maxv, _, maxloc = cv2.minMaxLoc(res)
+            return x0 + maxloc[0], y0 + maxloc[1], float(maxv)
+        except Exception:
+            return None
+
+    def _box_map_tag_fit(self, gray, mgray, srects, mrects, s_to_m,
+                         sx_pg, sy_pg):
+        """[PATCH:tag-fit] WO-BM2 T2: the page's shift and scale fitted
+        from PRINTED TAG positions (scan = scale*master + shift). For each
+        matched box, its master tag is template-matched in the found
+        rectangle's neighborhood; with >= 2 such tag fixes the scale comes
+        from median pairwise position ratios (per axis, only pairs at
+        least 100px apart on that axis -- otherwise the page-size ratio)
+        and the shift from median offsets. Rectangle DIMENSIONS are never
+        used: handwriting stretches rectangles but cannot move printed
+        ink, so this estimate cannot be poisoned the way the height/width
+        ratio medians were on the 19:06 run (b drifted to ~1.158).
+        Returns (a, b, tx, ty), or None with fewer than 2 tag fixes."""
+        fixes = []
+        for i, j in s_to_m.items():
+            info = self._box_map_master_tag(mgray, mrects[j])
+            if info is None:
+                continue
+            tmpl, mtx, mty = info
+            mx, my = mrects[j][0], mrects[j][1]
+            ex = srects[i][0] + (mtx - mx) * sx_pg
+            ey = srects[i][1] + (mty - my) * sy_pg
+            hit = self._box_map_find_tag_on_page(gray, tmpl, ex, ey, 40,
+                                                 sx_pg, sy_pg)
+            if hit is None or hit[2] < 0.75:
+                continue
+            fixes.append((float(mtx), float(mty), float(hit[0]),
+                          float(hit[1])))
+        if len(fixes) < 2:
+            return None
+        med = self._box_map_median
+        MIN_SPREAD = 100.0
+        ar, br = [], []
+        for k in range(len(fixes)):
+            for l in range(k + 1, len(fixes)):
+                dmx = fixes[l][0] - fixes[k][0]
+                dmy = fixes[l][1] - fixes[k][1]
+                if abs(dmx) >= MIN_SPREAD:
+                    ar.append((fixes[l][2] - fixes[k][2]) / dmx)
+                if abs(dmy) >= MIN_SPREAD:
+                    br.append((fixes[l][3] - fixes[k][3]) / dmy)
+        a = med(ar) if ar else sx_pg
+        b = med(br) if br else sy_pg
+        tx = med([fx[2] - a * fx[0] for fx in fixes])
+        ty = med([fx[3] - b * fx[1] for fx in fixes])
+        return a, b, tx, ty
+
+    def _box_map_filtered_est(self, srects, mrects, s_to_m, sx_pg, sy_pg):
+        """[PATCH:tag-fit] WO-BM2 T2: the rect-ratio estimator, but with
+        dimension ratios outside 0.90-1.10 of the page scale EXCLUDED (a
+        handwriting-stretched rectangle cannot set the scale). The
+        fallback when fewer than 2 tag fixes exist on a page. Returns
+        (a, b, tx, ty) or None when nothing usable remains."""
+        if not s_to_m:
+            return None
+        med = self._box_map_median
+        if len(s_to_m) == 1:
+            i, j = next(iter(s_to_m.items()))
+            a, b = sx_pg, sy_pg
+            tx = (srects[i][0] + srects[i][2] / 2.0) \
+                - a * (mrects[j][0] + mrects[j][2] / 2.0)
+            ty = (srects[i][1] + srects[i][3] / 2.0) \
+                - b * (mrects[j][1] + mrects[j][3] / 2.0)
+            return a, b, tx, ty
+        wr = [srects[i][2] / float(mrects[j][2]) for i, j in s_to_m.items()
+              if 0.90 * sx_pg <= srects[i][2] / float(mrects[j][2])
+              <= 1.10 * sx_pg]
+        hr = [srects[i][3] / float(mrects[j][3]) for i, j in s_to_m.items()
+              if 0.90 * sy_pg <= srects[i][3] / float(mrects[j][3])
+              <= 1.10 * sy_pg]
+        if not wr or not hr:
+            return None
+        a, b = med(wr), med(hr)
+        tx = med([(srects[i][0] + srects[i][2] / 2.0)
+                  - a * (mrects[j][0] + mrects[j][2] / 2.0)
+                  for i, j in s_to_m.items()])
+        ty = med([(srects[i][1] + srects[i][3] / 2.0)
+                  - b * (mrects[j][1] + mrects[j][3] / 2.0)
+                  for i, j in s_to_m.items()])
+        return a, b, tx, ty
+
+    def _box_map_master_cut(self, page_snippets, b_id, footer_num,
+                            full_page_img_path, scan_page_num):
+        """[PATCH:box-source] WO-BM3 T1: tag-registered cropping. With
+        LEDGER_BOX_SOURCE=master, every answer box is CUT at the MASTER's
+        coordinates (size = master box x the tag-fitted scale, each crop
+        anchored on its OWN matched printed tag) instead of trusting the
+        finder's contours, which handwriting stretches. The finder still
+        runs as a CROSS-CHECK: its rectangles are paired to the cut crops,
+        today's stray handling is kept, and a material disagreement is
+        logged. Returns the snippet list in master reading order, or None
+        when this page must take the finder path UNCHANGED: unreadable
+        footer (999), a page outside the master's map, fewer than 2 tag
+        fixes on the page (by design the ONLY guard for wrong-assignment
+        pages), or any error."""
+        try:
+            bmap = getattr(self, "_box_map", None)
+            last = getattr(self, "_box_map_last", None)
+            if not bmap or last is None:
+                return None
+            try:
+                offset = int(os.environ.get("LEDGER_S2CTX_PAGE_OFFSET", "0"))
+                idx = int(footer_num) - 1 + offset
+            except (TypeError, ValueError):
+                return None
+            if int(footer_num) == 999 or idx not in bmap:
+                return None
+            master = bmap[idx]
+            mrects = master["rects"]
+            srects = last["rects"]
+            pw_s, ph_s = last["size"]
+            pw_m, ph_m = master["size"]
+            if not mrects or not pw_m or not ph_m:
+                return None
+            sx_pg = pw_s / float(pw_m)
+            sy_pg = ph_s / float(ph_m)
+
+            img = cv2.imread(full_page_img_path)
+            mimg = cv2.imread(master["file"])
+            if img is None or mimg is None:
+                return None
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            mgray = cv2.cvtColor(mimg, cv2.COLOR_BGR2GRAY)
+
+            try:
+                tag_win = int(os.environ.get(
+                    "LEDGER_BOX_TAG_SEARCH_PX", "150"))
+            except (TypeError, ValueError):
+                tag_win = 150
+
+            # --- 1. TAGS FIRST: each master box's printed tag is searched
+            # on the FULL page around the spot the page-size scale predicts.
+            # Handwriting stretches rectangles but cannot move printed ink.
+            tag_hits = {}    # master index -> (px, py, score, mtx, mty)
+            fixes = []
+            for j, rect in enumerate(mrects):
+                info = self._box_map_master_tag(mgray, rect)
+                if info is None:
+                    continue
+                tmpl, mtx, mty = info
+                hit = self._box_map_find_tag_on_page(
+                    gray, tmpl, mtx * sx_pg, mty * sy_pg, tag_win,
+                    sx_pg, sy_pg)
+                if hit is not None and hit[2] >= 0.75:
+                    tag_hits[j] = (hit[0], hit[1], hit[2], mtx, mty)
+                    fixes.append((float(mtx), float(mty),
+                                  float(hit[0]), float(hit[1])))
+
+            # --- 2. FIT from tags, the WO-BM2 way. Fewer than 2 tag fixes:
+            # the whole page falls back to the finder path unchanged.
+            if len(fixes) < 2:
+                return None
+            med = self._box_map_median
+            MIN_SPREAD = 100.0
+            ar, br = [], []
+            for k in range(len(fixes)):
+                for l in range(k + 1, len(fixes)):
+                    dmx = fixes[l][0] - fixes[k][0]
+                    dmy = fixes[l][1] - fixes[k][1]
+                    if abs(dmx) >= MIN_SPREAD:
+                        ar.append((fixes[l][2] - fixes[k][2]) / dmx)
+                    if abs(dmy) >= MIN_SPREAD:
+                        br.append((fixes[l][3] - fixes[k][3]) / dmy)
+            a = med(ar) if ar else sx_pg
+            b = med(br) if br else sy_pg
+            tx = med([fx[2] - a * fx[0] for fx in fixes])
+            ty = med([fx[3] - b * fx[1] for fx in fixes])
+
+            # --- the finder's pairing (today's rule, incl. the legacy
+            # switch) -- used for the gate-failure fallback and the strays.
+            diag = (pw_m * pw_m + ph_m * ph_m) ** 0.5
+            pairs = []
+            if os.environ.get("LEDGER_BOX_PAIRING", "overlap") == "legacy":
+                TOL_SHIFT = 0.045 * diag
+                TOL_SIZE = 0.15
+                for i, (sx, sy, sw, sh) in enumerate(srects):
+                    for j, (mx, my, mw, mh) in enumerate(mrects):
+                        if abs(sw / sx_pg - mw) > TOL_SIZE * mw:
+                            continue
+                        if abs(sh / sy_pg - mh) > TOL_SIZE * mh:
+                            continue
+                        dcx = (sx + sw / 2.0) / sx_pg - (mx + mw / 2.0)
+                        dcy = (sy + sh / 2.0) / sy_pg - (my + mh / 2.0)
+                        d = (dcx * dcx + dcy * dcy) ** 0.5
+                        if d <= TOL_SHIFT:
+                            pairs.append((d, i, j))
+            else:
+                for j, (mx, my, mw, mh) in enumerate(mrects):
+                    gx0, gy0 = mx * sx_pg, my * sy_pg
+                    gx1, gy1 = (mx + mw) * sx_pg, (my + mh) * sy_pg
+                    marea = (gx1 - gx0) * (gy1 - gy0)
+                    if marea <= 0:
+                        continue
+                    for i, (sx, sy, sw, sh) in enumerate(srects):
+                        ix = min(sx + sw, gx1) - max(sx, gx0)
+                        iy = min(sy + sh, gy1) - max(sy, gy0)
+                        if ix <= 0 or iy <= 0:
+                            continue
+                        cover = (ix * iy) / marea
+                        if cover >= 0.5:
+                            pairs.append((-cover, i, j))
+            pairs.sort()
+            s_to_m = {}
+            m_to_s = {}
+            for d, i, j in pairs:
+                if i in s_to_m or j in m_to_s:
+                    continue
+                s_to_m[i] = j
+                m_to_s[j] = i
+
+            # --- 3. CUT EVERY BOX at the master's coordinates.
+            delivered = []    # (master_index, path, cut_rect, how)
+            lost = []
+            n_tag = n_fit = n_fb = 0
+            for j, (mx, my, mw, mh) in enumerate(mrects):
+                w = a * mw
+                h = b * mh
+                margin = max(8, int(round(0.04 * min(w, h))))
+                mmx = max(1, int(round(margin / a)))
+                mmy = max(1, int(round(margin / b)))
+                mx0 = max(0, mx - mmx)
+                my0 = max(0, my - mmy)
+                mx1 = min(mimg.shape[1], mx + mw + mmx)
+                my1 = min(mimg.shape[0], my + mh + mmy)
+                mcrop = mgray[my0:my1, mx0:mx1]
+                hit = tag_hits.get(j)
+                if hit is not None:
+                    px, py, tscore, mtx, mty = hit
+                    bx0 = int(round(px - a * (mtx - mx)))
+                    by0 = int(round(py - b * (mty - my)))
+                    x0 = max(0, bx0 - margin)
+                    y0 = max(0, by0 - margin)
+                    x1 = min(img.shape[1], int(round(bx0 + w)) + margin)
+                    y1 = min(img.shape[0], int(round(by0 + h)) + margin)
+                else:
+                    cx = a * (mx + mw / 2.0) + tx
+                    cy = b * (my + mh / 2.0) + ty
+                    x0 = max(0, int(round(cx - w / 2.0)) - margin)
+                    y0 = max(0, int(round(cy - h / 2.0)) - margin)
+                    x1 = min(img.shape[1],
+                             int(round(cx + w / 2.0)) + margin)
+                    y1 = min(img.shape[0],
+                             int(round(cy + h / 2.0)) + margin)
+                ok = False
+                detail = ""
+                if x1 - x0 >= 20 and y1 - y0 >= 20:
+                    if hit is not None:
+                        # anchored on its own printed tag: accepted (the
+                        # WO-BM2 rule); the frame is measured for the log.
+                        fr, _tg, _d1, _d2, err = self._box_map_scores(
+                            gray[y0:y1, x0:x1], mcrop, margin=margin,
+                            win=20)
+                        frs = ("n/a" if err is not None or fr is None
+                               else format(fr, ".2f"))
+                        ok = True
+                        detail = f"frame {frs}, tag {tscore:.2f}"
+                    else:
+                        # no tag fix of its own: cut at the fitted
+                        # coordinates, today's frame >= 0.80 gate.
+                        fr, _tg, _d1, _d2, err = self._box_map_scores(
+                            gray[y0:y1, x0:x1], mcrop, margin=margin,
+                            win=20)
+                        if err:
+                            detail = err
+                        else:
+                            ok = fr >= 0.80
+                            detail = f"frame {fr:.2f}, tag n/a"
+                else:
+                    detail = "degenerate crop"
+                if ok:
+                    snippet_path = os.path.join(
+                        TEMP_DIR,
+                        f"snippet_p{scan_page_num}_m{j}.png")
+                    cv2.imwrite(snippet_path, img[y0:y1, x0:x1])
+                    delivered.append((j, snippet_path, (x0, y0, x1, y1)))
+                    if hit is not None:
+                        n_tag += 1
+                    else:
+                        n_fit += 1
+                        self.log_message(
+                            f"    -> [BOX MAP] ID {b_id}, page "
+                            f"{footer_num}: box {j + 1} cut at the fitted "
+                            f"coordinates ({detail}).")
+                    continue
+                # gate failed: the finder's crop for this box, if it has one
+                i = m_to_s.get(j)
+                if i is not None and i < len(page_snippets):
+                    sx, sy, sw, sh = srects[i]
+                    delivered.append((j, page_snippets[i],
+                                      (sx, sy, sx + sw, sy + sh)))
+                    n_fb += 1
+                    self.log_message(
+                        f"    -> [BOX MAP] ID {b_id}, page {footer_num}: "
+                        f"master-coordinate crop for box {j + 1} failed "
+                        f"verification ({detail}); the finder's crop was "
+                        "used instead.")
+                    continue
+                # nothing to send for this box: reject + save + notice below
+                lost.append(j)
+                self.log_message(
+                    f"    -> [BOX MAP] ID {b_id}, page {footer_num}: "
+                    f"master-coordinate crop for box {j + 1} REJECTED "
+                    f"({detail}).")
+                self._box_map_save_reject(
+                    img[y0:y1, x0:x1] if (x1 > x0 and y1 > y0) else None,
+                    b_id, footer_num, j + 1, detail)
+
+            self.log_message(
+                f"    -> [BOX MAP] ID {b_id}, page {footer_num}: "
+                f"{len(delivered)} of {len(mrects)} box(es) cut at the "
+                f"master's coordinates ({n_tag} tag-anchored, {n_fit} at "
+                f"fitted coordinates, {n_fb} from the finder).")
+
+            # --- 4. the finder as CROSS-CHECK: today's stray handling.
+            extras = [i for i in range(len(srects)) if i not in s_to_m]
+            drop_extras = os.environ.get(
+                "LEDGER_BOX_DROP_EXTRAS", "1") != "0"
+            n_lost = len(lost)
+
+            def _cut_key(r):
+                return (r[1] // 150, r[0])
+
+            out = [(_cut_key(rect), path) for _j, path, rect in delivered]
+            if extras:
+                if drop_extras and n_lost == 0:
+                    for _ in extras:
+                        self._box_map_record_notice(
+                            f"ID {b_id}, page {footer_num}: a stray "
+                            "rectangle (likely drawn by the student) was "
+                            "ignored.")
+                else:
+                    for i in extras:
+                        if i < len(page_snippets):
+                            sx, sy, sw, sh = srects[i]
+                            out.append(((sy // 150, sx), page_snippets[i]))
+                        self._box_map_record_notice(
+                            f"ID {b_id}, page {footer_num}: an extra "
+                            "rectangle on the page was treated as an "
+                            "answer box. Please verify.")
+                    out.sort(key=lambda t: t[0])
+            # a PAIRED finder rectangle that overlaps no cut crop is a
+            # material disagreement worth a notice (an unpaired one was
+            # already reported as a stray/extra just above).
+            for i, (sx, sy, sw, sh) in enumerate(srects):
+                if i not in s_to_m:
+                    continue
+                overlaps = False
+                for _j, _path, (cx0, cy0, cx1, cy1) in delivered:
+                    ix = min(sx + sw, cx1) - max(sx, cx0)
+                    iy = min(sy + sh, cy1) - max(sy, cy0)
+                    if ix > 0 and iy > 0 and \
+                            (ix * iy) >= 0.5 * (sw * sh):
+                        overlaps = True
+                        break
+                if not overlaps:
+                    self._box_map_record_notice(
+                        f"ID {b_id}, page {footer_num}: the box finder "
+                        "found a rectangle that no master-coordinate crop "
+                        "covers. Please verify this page.")
+
+            if n_lost:
+                matched_n = len(mrects) - n_lost
+                total_n = len(mrects)
+                if n_lost == 1:
+                    self._box_map_record_notice(
+                        f"ID {b_id}, page {footer_num}: found {matched_n} "
+                        f"of {total_n} answer boxes and could not recover "
+                        "the missing one. That answer was NOT scored. "
+                        "Please check this page by hand.")
+                else:
+                    self._box_map_record_notice(
+                        f"ID {b_id}, page {footer_num}: found {matched_n} "
+                        f"of {total_n} answer boxes and could not recover "
+                        f"{n_lost} missing ones. Those answers were NOT "
+                        "scored. Please check this page by hand.")
+
+            # the same page shift/scale statistic the finder path records,
+            # so pages that FALL BACK later in the run see identical
+            # run-median behavior in both modes.
+            est = None
+            if len(s_to_m) >= 2:
+                ea = self._box_map_median(
+                    [srects[i][2] / float(mrects[j][2])
+                     for i, j in s_to_m.items()])
+                eb = self._box_map_median(
+                    [srects[i][3] / float(mrects[j][3])
+                     for i, j in s_to_m.items()])
+                etx = self._box_map_median(
+                    [(srects[i][0] + srects[i][2] / 2.0)
+                     - ea * (mrects[j][0] + mrects[j][2] / 2.0)
+                     for i, j in s_to_m.items()])
+                ety = self._box_map_median(
+                    [(srects[i][1] + srects[i][3] / 2.0)
+                     - eb * (mrects[j][1] + mrects[j][3] / 2.0)
+                     for i, j in s_to_m.items()])
+                est = (ea, eb, etx, ety)
+            elif len(s_to_m) == 1:
+                i, j = next(iter(s_to_m.items()))
+                ea, eb = sx_pg, sy_pg
+                etx = (srects[i][0] + srects[i][2] / 2.0) \
+                    - ea * (mrects[j][0] + mrects[j][2] / 2.0)
+                ety = (srects[i][1] + srects[i][3] / 2.0) \
+                    - eb * (mrects[j][1] + mrects[j][3] / 2.0)
+                est = (ea, eb, etx, ety)
+            if est is not None:
+                if not hasattr(self, "_box_map_page_stats"):
+                    self._box_map_page_stats = []
+                self._box_map_page_stats.append(est)
+
+            return [path for _key, path in out]
+        except Exception as e:
+            self.log_message(f"[!] [BOX MAP] master-source cut failed on "
+                             f"page {footer_num} (ID {b_id}): {e} -- the "
+                             "finder path is used.")
+            return None
+
+    def _box_map_reconcile(self, page_snippets, b_id, footer_num,
+                           full_page_img_path, scan_page_num):
+        """Match this scan page's found boxes against the master's box map.
+        Clean page (every master box matched, nothing extra): returns the
+        list UNTOUCHED -- byte-identical path. An extra scan box is kept, as
+        today, with a notice. A missing master box is re-cropped from the
+        scan at the master's rectangle (shift/scale estimated from the
+        matched boxes, else from earlier pages), VERIFIED against the
+        master's printed structure, and inserted in master reading order; an
+        unrecoverable box gets a plain-words NOT-scored notice."""
+        try:
+            if os.environ.get("LEDGER_BOX_MAP", "1") == "0":
+                return page_snippets
+            # [PATCH:box-source] WO-BM3 T1: LEDGER_BOX_SOURCE=master cuts
+            # every box at the master's coordinates (tag-registered).
+            # WO-BM3b T2 made "master" the DEFAULT (unset = master) after
+            # the quiz-corpus proof; LEDGER_BOX_SOURCE=finder -- or any
+            # other explicit non-"master" value -- restores the finder
+            # path below bit-identically, with no code change. A None
+            # from the master path (unreadable footer, out-of-map page,
+            # < 2 tag fixes, any error) also falls through to the finder
+            # path unchanged.
+            if os.environ.get("LEDGER_BOX_SOURCE", "master") == "master":
+                out = self._box_map_master_cut(
+                    page_snippets, b_id, footer_num, full_page_img_path,
+                    scan_page_num)
+                if out is not None:
+                    return out
+            bmap = getattr(self, "_box_map", None)
+            last = getattr(self, "_box_map_last", None)
+            if not bmap or last is None:
+                return page_snippets
+            try:
+                offset = int(os.environ.get("LEDGER_S2CTX_PAGE_OFFSET", "0"))
+                idx = int(footer_num) - 1 + offset
+            except (TypeError, ValueError):
+                return page_snippets
+            if int(footer_num) == 999 or idx not in bmap:
+                return page_snippets
+
+            master = bmap[idx]
+            mrects = master["rects"]
+            srects = last["rects"]
+            pw_s, ph_s = last["size"]
+            pw_m, ph_m = master["size"]
+            if not pw_m or not ph_m:
+                return page_snippets
+            sx_pg = pw_s / float(pw_m)
+            sy_pg = ph_s / float(ph_m)
+            diag = (pw_m * pw_m + ph_m * ph_m) ** 0.5
+
+            # --- match scan boxes to master boxes ---
+            # [PATCH:box-pairing] WO-BM1 T2: pair by OVERLAP. A rectangle
+            # stretched by handwriting still COVERS its master box (measured
+            # on the 16:18 run: ID 108 p2 box 6 was 17.4% too wide for the
+            # legacy size test while its center was only 46px off and it
+            # covered 95% of the box). A scan rect is a candidate when the
+            # intersection covers >= 0.5 of the master box's scaled area;
+            # assigned greedily by largest coverage, one-to-one. Everything
+            # downstream is unchanged. LEDGER_BOX_PAIRING=legacy restores
+            # the old size+center rule exactly.
+            pairs = []
+            if os.environ.get("LEDGER_BOX_PAIRING", "overlap") == "legacy":
+                TOL_SHIFT = 0.045 * diag   # ~0.6 inch at 300 dpi
+                TOL_SIZE = 0.15
+                for i, (sx, sy, sw, sh) in enumerate(srects):
+                    for j, (mx, my, mw, mh) in enumerate(mrects):
+                        if abs(sw / sx_pg - mw) > TOL_SIZE * mw:
+                            continue
+                        if abs(sh / sy_pg - mh) > TOL_SIZE * mh:
+                            continue
+                        dcx = (sx + sw / 2.0) / sx_pg - (mx + mw / 2.0)
+                        dcy = (sy + sh / 2.0) / sy_pg - (my + mh / 2.0)
+                        d = (dcx * dcx + dcy * dcy) ** 0.5
+                        if d <= TOL_SHIFT:
+                            pairs.append((d, i, j))
+            else:
+                for j, (mx, my, mw, mh) in enumerate(mrects):
+                    gx0, gy0 = mx * sx_pg, my * sy_pg
+                    gx1, gy1 = (mx + mw) * sx_pg, (my + mh) * sy_pg
+                    marea = (gx1 - gx0) * (gy1 - gy0)
+                    if marea <= 0:
+                        continue
+                    for i, (sx, sy, sw, sh) in enumerate(srects):
+                        ix = min(sx + sw, gx1) - max(sx, gx0)
+                        iy = min(sy + sh, gy1) - max(sy, gy0)
+                        if ix <= 0 or iy <= 0:
+                            continue
+                        cover = (ix * iy) / marea
+                        if cover >= 0.5:
+                            # negated so the shared ascending sort + greedy
+                            # loop below takes the LARGEST coverage first
+                            pairs.append((-cover, i, j))
+            pairs.sort()
+            s_to_m = {}
+            m_to_s = {}
+            for d, i, j in pairs:
+                if i in s_to_m or j in m_to_s:
+                    continue
+                s_to_m[i] = j
+                m_to_s[j] = i
+
+            # --- this page's shift/scale estimate (scan = scale*master + shift) ---
+            est = None
+            if len(s_to_m) >= 2:
+                a = self._box_map_median([srects[i][2] / float(mrects[j][2])
+                                          for i, j in s_to_m.items()])
+                b = self._box_map_median([srects[i][3] / float(mrects[j][3])
+                                          for i, j in s_to_m.items()])
+                tx = self._box_map_median(
+                    [(srects[i][0] + srects[i][2] / 2.0)
+                     - a * (mrects[j][0] + mrects[j][2] / 2.0)
+                     for i, j in s_to_m.items()])
+                ty = self._box_map_median(
+                    [(srects[i][1] + srects[i][3] / 2.0)
+                     - b * (mrects[j][1] + mrects[j][3] / 2.0)
+                     for i, j in s_to_m.items()])
+                est = (a, b, tx, ty)
+            elif len(s_to_m) == 1:
+                i, j = next(iter(s_to_m.items()))
+                a, b = sx_pg, sy_pg
+                tx = (srects[i][0] + srects[i][2] / 2.0) \
+                    - a * (mrects[j][0] + mrects[j][2] / 2.0)
+                ty = (srects[i][1] + srects[i][3] / 2.0) \
+                    - b * (mrects[j][1] + mrects[j][3] / 2.0)
+                est = (a, b, tx, ty)
+            if est is not None:
+                if not hasattr(self, "_box_map_page_stats"):
+                    self._box_map_page_stats = []
+                self._box_map_page_stats.append(est)
+
+            extras = [i for i in range(len(srects)) if i not in s_to_m]
+            missing = [j for j in range(len(mrects)) if j not in m_to_s]
+
+            # Clean page: the byte-identical path. Nothing logged, nothing touched.
+            if not extras and not missing:
+                return page_snippets
+
+            # [PATCH:drop-extras] WO-BM1 T4: a scan rectangle paired with no
+            # master box (e.g. one the student drew around their own work)
+            # is DROPPED from what is sent, but ONLY when every master box
+            # on this page is accounted for (matched, or recovered-and-
+            # accepted) -- decided AFTER recovery below. On any other page
+            # it is kept and sent exactly as today, because it might BE the
+            # missing box. LEDGER_BOX_DROP_EXTRAS=0 restores today's
+            # keep-everything behavior exactly.
+            drop_extras = os.environ.get("LEDGER_BOX_DROP_EXTRAS", "1") != "0"
+            if not drop_extras:
+                for _ in extras:
+                    self._box_map_record_notice(
+                        f"ID {b_id}, page {footer_num}: an extra rectangle on the "
+                        "page was treated as an answer box. Please verify.")
+                if not missing:
+                    return page_snippets
+
+            # --- no estimate from this page: borrow the run-wide median ---
+            if est is None:
+                stats = getattr(self, "_box_map_page_stats", [])
+                if len(stats) >= 5:
+                    est = tuple(self._box_map_median([s[k] for s in stats])
+                                for k in range(4))
+
+            matched_n = len(m_to_s)
+            total_n = len(mrects)
+            recovered = []     # (master_index, snippet_path)
+            if est is not None and missing:
+                a, b, tx, ty = est
+                img = cv2.imread(full_page_img_path)
+                mimg = cv2.imread(master["file"])
+                if img is None or mimg is None:
+                    est = None
+                else:
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    mgray = cv2.cvtColor(mimg, cv2.COLOR_BGR2GRAY)
+                    # [PATCH:tag-recovery] WO-BM1 T3: recovery is anchored
+                    # on the box's printed tag number. The tag template is
+                    # searched in a wider window; found at >= 0.75, the crop
+                    # is RE-CUT centered on the measured tag position and
+                    # ACCEPTED (the frame score is still computed and
+                    # logged, but no longer rejects a tag-verified crop --
+                    # measured on the 16:18 run: 5 of 8 rejections had tag
+                    # >= 0.93 with frame <= 0.30, i.e. the crop was merely
+                    # 10-15px off target). A master box with NO printed tag
+                    # ink keeps the old frame >= 0.80 gate exactly; a page
+                    # whose tag cannot be found anywhere in the window is
+                    # REJECTED -- the protection against wrong-assignment
+                    # pages. LEDGER_BOX_RECOVER_TAG=0 restores the old
+                    # two-test gate with the old +/-20px window exactly.
+                    recover_tag = os.environ.get(
+                        "LEDGER_BOX_RECOVER_TAG", "1") != "0"
+                    # [PATCH:page-tag] WO-BM2 T2: by default the tag is
+                    # searched on the FULL PAGE (+/-150 page px around the
+                    # predicted spot) and the crop is anchored on it;
+                    # LEDGER_BOX_TAG_PAGE=0 restores the WO-BM1 behavior
+                    # (search inside the predicted crop, +/-80) exactly.
+                    tag_page = os.environ.get(
+                        "LEDGER_BOX_TAG_PAGE", "1") != "0"
+                    default_win = 150 if (recover_tag and tag_page) else 80
+                    try:
+                        tag_win = int(os.environ.get(
+                            "LEDGER_BOX_TAG_SEARCH_PX", str(default_win)))
+                    except (TypeError, ValueError):
+                        tag_win = default_win
+                    # [PATCH:tag-fit] WO-BM2 T2: anchor the page estimate
+                    # on printed tags, never on found-rectangle dimensions
+                    # (stretched rectangles poisoned the height medians on
+                    # the 19:06 run). LEDGER_BOX_TAG_FIT=0 restores the
+                    # rect-ratio estimator alone.
+                    recover_missing = list(missing)
+                    if recover_tag and os.environ.get(
+                            "LEDGER_BOX_TAG_FIT", "1") != "0":
+                        fit = self._box_map_tag_fit(
+                            gray, mgray, srects, mrects, s_to_m,
+                            sx_pg, sy_pg)
+                        if fit is None:
+                            fit = self._box_map_filtered_est(
+                                srects, mrects, s_to_m, sx_pg, sy_pg)
+                        if fit is None:
+                            stats = getattr(self, "_box_map_page_stats", [])
+                            if len(stats) >= 5:
+                                fit = tuple(
+                                    self._box_map_median([s[k] for s in
+                                                          stats])
+                                    for k in range(4))
+                        if fit is not None:
+                            a, b, tx, ty = fit
+                        else:
+                            # no usable estimate at all: nothing to anchor
+                            # a recovery on; the NOT-scored notices below
+                            # say so in plain words
+                            recover_missing = []
+                    for j in recover_missing:
+                        mx, my, mw, mh = mrects[j]
+                        w = a * mw
+                        h = b * mh
+                        cx = a * (mx + mw / 2.0) + tx
+                        cy = b * (my + mh / 2.0) + ty
+                        margin = max(8, int(round(0.04 * min(w, h))))
+                        x0 = max(0, int(round(cx - w / 2.0)) - margin)
+                        y0 = max(0, int(round(cy - h / 2.0)) - margin)
+                        x1 = min(img.shape[1], int(round(cx + w / 2.0)) + margin)
+                        y1 = min(img.shape[0], int(round(cy + h / 2.0)) + margin)
+                        if x1 - x0 < 20 or y1 - y0 < 20:
+                            continue
+                        # master crop with the EQUIVALENT margin so the two
+                        # structures line up for verification
+                        mmx = max(1, int(round(margin / a)))
+                        mmy = max(1, int(round(margin / b)))
+                        mx0 = max(0, mx - mmx)
+                        my0 = max(0, my - mmy)
+                        mx1 = min(mimg.shape[1], mx + mw + mmx)
+                        my1 = min(mimg.shape[0], my + mh + mmy)
+                        scan_crop = img[y0:y1, x0:x1]
+                        if not recover_tag:
+                            ok, detail = self._box_map_verify(
+                                gray[y0:y1, x0:x1], mgray[my0:my1, mx0:mx1],
+                                margin=margin)
+                        elif not tag_page:
+                            mcrop = mgray[my0:my1, mx0:mx1]
+                            fr, tag, tdx, tdy, err = self._box_map_scores(
+                                gray[y0:y1, x0:x1], mcrop, margin=margin,
+                                win=tag_win)
+                            if err:
+                                ok, detail = False, err
+                            elif tag is None:
+                                # no printed tag ink in this master box:
+                                # today's frame gate, unchanged
+                                ok = fr >= 0.80
+                                detail = f"frame {fr:.2f}, tag n/a"
+                            elif tag >= 0.75:
+                                # re-cut the crop from the page, shifted by
+                                # the tag's measured offset (master-crop px
+                                # converted back to scan px), then accept
+                                cw, ch = x1 - x0, y1 - y0
+                                dx = int(round(tdx * cw
+                                               / float(mx1 - mx0 or 1)))
+                                dy = int(round(tdy * ch
+                                               / float(my1 - my0 or 1)))
+                                x0 = max(0, min(img.shape[1] - cw, x0 + dx))
+                                y0 = max(0, min(img.shape[0] - ch, y0 + dy))
+                                x1, y1 = x0 + cw, y0 + ch
+                                scan_crop = img[y0:y1, x0:x1]
+                                fr2, tag2, _d1, _d2, err2 = \
+                                    self._box_map_scores(
+                                        gray[y0:y1, x0:x1], mcrop,
+                                        margin=margin, win=tag_win)
+                                ok = True
+                                if err2 is None and tag2 is not None:
+                                    detail = (f"frame {fr2:.2f}, tag "
+                                              f"{tag2:.2f}; crop re-centered"
+                                              f" on the printed tag "
+                                              f"({dx:+d},{dy:+d}px)")
+                                else:
+                                    detail = (f"frame {fr:.2f}, tag "
+                                              f"{tag:.2f}; crop re-centered"
+                                              f" on the printed tag "
+                                              f"({dx:+d},{dy:+d}px)")
+                            else:
+                                ok = False
+                                detail = (f"frame {fr:.2f}, tag {tag:.2f}; "
+                                          "the box's printed tag number was "
+                                          f"not found within {tag_win}px of "
+                                          "the expected spot")
+                        else:
+                            # [PATCH:page-tag] WO-BM2 T2: search the box's
+                            # printed tag on the PAGE, +/-tag_win page px
+                            # around its predicted spot. The tag sits at
+                            # the box's top-left corner, so a crop that
+                            # landed low pushes it off the crop's EDGE --
+                            # searching inside the crop (WO-BM1) could
+                            # never see it. Found at >= 0.75: the final
+                            # crop is cut anchored on the matched tag,
+                            # sized from the MASTER box times the fitted
+                            # scale, and ACCEPTED (frame logged only).
+                            # Not found anywhere in the region: REJECTED
+                            # -- the guard against wrong-assignment pages.
+                            mcrop = mgray[my0:my1, mx0:mx1]
+                            info = self._box_map_master_tag(mgray, mrects[j])
+                            if info is None:
+                                # no printed tag ink in this master box:
+                                # today's frame gate, unchanged
+                                fr, _tg, _d1, _d2, err = \
+                                    self._box_map_scores(
+                                        gray[y0:y1, x0:x1], mcrop,
+                                        margin=margin, win=20)
+                                if err:
+                                    ok, detail = False, err
+                                else:
+                                    ok = fr >= 0.80
+                                    detail = f"frame {fr:.2f}, tag n/a"
+                            else:
+                                tmpl, mtx, mty = info
+                                ex = a * mtx + tx
+                                ey = b * mty + ty
+                                hit = self._box_map_find_tag_on_page(
+                                    gray, tmpl, ex, ey, tag_win, a, b)
+                                if hit is not None and hit[2] >= 0.75:
+                                    px, py, tscore = hit
+                                    bx0 = int(round(px - a * (mtx - mx)))
+                                    by0 = int(round(py - b * (mty - my)))
+                                    x0 = max(0, bx0 - margin)
+                                    y0 = max(0, by0 - margin)
+                                    x1 = min(img.shape[1],
+                                             int(round(bx0 + w)) + margin)
+                                    y1 = min(img.shape[0],
+                                             int(round(by0 + h)) + margin)
+                                    scan_crop = img[y0:y1, x0:x1]
+                                    fr2, _tg2, _d1, _d2, err2 = \
+                                        self._box_map_scores(
+                                            gray[y0:y1, x0:x1], mcrop,
+                                            margin=margin, win=20)
+                                    ok = True
+                                    frs = ("n/a" if err2 is not None
+                                           or fr2 is None
+                                           else format(fr2, ".2f"))
+                                    dx = int(round(px - ex))
+                                    dy = int(round(py - ey))
+                                    detail = (f"frame {frs}, tag "
+                                              f"{tscore:.2f}; crop anchored"
+                                              f" on the printed tag, found "
+                                              f"{dx:+d},{dy:+d}px from the "
+                                              "predicted spot")
+                                else:
+                                    best = 0.0 if hit is None else hit[2]
+                                    fr, _tg, _d1, _d2, err = \
+                                        self._box_map_scores(
+                                            gray[y0:y1, x0:x1], mcrop,
+                                            margin=margin, win=20)
+                                    frs = ("n/a" if err is not None
+                                           or fr is None
+                                           else format(fr, ".2f"))
+                                    ok = False
+                                    detail = (f"frame {frs}, tag "
+                                              f"{best:.2f}; the box's "
+                                              "printed tag number was not "
+                                              f"found within {tag_win}px "
+                                              "of the expected spot on "
+                                              "the page")
+                        self.log_message(
+                            f"    -> [BOX MAP] ID {b_id}, page {footer_num}: "
+                            f"recovery crop for master box {j + 1} "
+                            f"{'VERIFIED' if ok else 'REJECTED'} ({detail}).")
+                        if not ok:
+                            # [PATCH:box-rejects] WO-BM1 T5: keep the crop
+                            self._box_map_save_reject(
+                                scan_crop, b_id, footer_num, j + 1, detail)
+                            continue
+                        snippet_path = os.path.join(
+                            TEMP_DIR,
+                            f"snippet_p{scan_page_num}_b"
+                            f"{len(page_snippets) + len(recovered)}.png")
+                        cv2.imwrite(snippet_path, scan_crop)
+                        recovered.append((j, snippet_path))
+
+            # --- insert verified crops in master reading order ---
+            out = list(page_snippets)
+            ranks = [s_to_m.get(i) for i in range(len(page_snippets))]
+            for j, snippet_path in sorted(recovered):
+                pos = 0
+                for k, r in enumerate(ranks):
+                    if r is not None and r < j:
+                        pos = k + 1
+                out.insert(pos, snippet_path)
+                ranks.insert(pos, j)
+
+            n_rec = len(recovered)
+            n_lost = len(missing) - n_rec
+            # [PATCH:drop-extras] WO-BM1 T4: the stray decision, now that
+            # recovery has settled whether every master box is accounted for.
+            if drop_extras and extras:
+                if n_lost == 0:
+                    stray = {page_snippets[i] for i in extras}
+                    out = [p for p in out if p not in stray]
+                    for _ in extras:
+                        self._box_map_record_notice(
+                            f"ID {b_id}, page {footer_num}: a stray "
+                            "rectangle (likely drawn by the student) was "
+                            "ignored.")
+                else:
+                    for _ in extras:
+                        self._box_map_record_notice(
+                            f"ID {b_id}, page {footer_num}: an extra "
+                            "rectangle on the page was treated as an answer "
+                            "box. Please verify.")
+            if n_rec:
+                if n_rec == 1:
+                    self._box_map_record_notice(
+                        f"ID {b_id}, page {footer_num}: 1 answer box was not "
+                        "found automatically and was recovered from the "
+                        "master's layout. Please verify.")
+                else:
+                    self._box_map_record_notice(
+                        f"ID {b_id}, page {footer_num}: {n_rec} answer boxes "
+                        "were not found automatically and were recovered from "
+                        "the master's layout. Please verify.")
+            if n_lost:
+                if n_lost == 1:
+                    self._box_map_record_notice(
+                        f"ID {b_id}, page {footer_num}: found {matched_n} of "
+                        f"{total_n} answer boxes and could not recover the "
+                        "missing one. That answer was NOT scored. Please "
+                        "check this page by hand.")
+                else:
+                    self._box_map_record_notice(
+                        f"ID {b_id}, page {footer_num}: found {matched_n} of "
+                        f"{total_n} answer boxes and could not recover "
+                        f"{n_lost} missing ones. Those answers were NOT "
+                        "scored. Please check this page by hand.")
+            return out
+        except Exception as e:
+            # Never let the safety net break the pipeline it protects.
+            self.log_message(f"[!] [BOX MAP] check failed on page "
+                             f"{footer_num} (ID {b_id}): {e} -- page sent "
+                             "as found.")
+            return page_snippets
+
     # ==========================================
     # SURGERY AREA 3: THE LOCAL FLASHCARD STITCH (UPGRADED TO 2D GRID)
     # ==========================================
@@ -3436,37 +5432,79 @@ class LedgerGUI:
                 pages[pg].append(p)
                 page_footers[pg].add(master_page_map.get(p) if master_page_map else None)
 
+            # [PATCH:page-order] WO-B1-3: order this student's scan pages by
+            # their printed (footer-derived) page number before packing, so
+            # every student produces the SAME chunk groupings and the prompt
+            # cache is written once, not once per scan order. Local reorder
+            # only -- box order within a page, the packing rule, the height
+            # limit and the per-chunk master logic are untouched. A page
+            # whose footer is missing or 999 KEEPS its scanned position
+            # (never guess a number); two pages with the same number stay in
+            # scanned order (stable sort) with one warning. LEDGER_SORT_PAGES=0
+            # restores scan order byte-identically.
+            if os.environ.get("LEDGER_SORT_PAGES", "1") != "0" and master_page_map:
+                def _footer_num(pg):
+                    fs = page_footers.get(pg)
+                    if fs and len(fs) == 1:
+                        f = next(iter(fs))
+                        if isinstance(f, int) and 0 < f < 999:
+                            return f
+                    return None
+                sortable = [pg for pg in page_order if _footer_num(pg) is not None]
+                placed = iter(sorted(sortable, key=_footer_num))
+                new_order = [pg if _footer_num(pg) is None else next(placed)
+                             for pg in page_order]
+                dup_nums = {}
+                for pg in sortable:
+                    dup_nums.setdefault(_footer_num(pg), []).append(pg)
+                for num, pgs in sorted(dup_nums.items()):
+                    if len(pgs) > 1:
+                        self.log_message(f"    -> WARNING (ID {b_id}): {len(pgs)} pages "
+                                         f"share printed page number {num}; keeping both, "
+                                         f"in scanned order.")
+                if new_order != page_order:
+                    self.log_message(f"    -> Pages for ID {b_id} reordered by printed "
+                                     f"page number before chunking.")
+                page_order = new_order
+
             # 2. Stitch each page into its own grid image (true heights).
+            # [PATCH:count-check] remember how many box crops each page grid
+            # holds; the chunk packer sums them onto the descriptor.
             page_imgs = []
             for pg in page_order:
                 canvas = self._stitch_paths_to_image(pages[pg])
                 if canvas is not None:
-                    page_imgs.append((canvas, page_footers[pg]))
+                    page_imgs.append((canvas, page_footers[pg], len(pages[pg])))
             if not page_imgs:
                 return []
 
             # 3. Greedily pack whole page grids into vertical chunks under budget.
+            # [PATCH:count-check] each chunk also carries how many box crops
+            # went into it, so the reply's item count can be verified.
             chunks = []
             cur = []
             cur_f = set()
+            cur_n = 0
             cur_h = 0
-            for img, fset in page_imgs:
+            for img, fset, n_boxes in page_imgs:
                 add = img.height + (PADDING if cur else 0)
                 if cur and (cur_h + add) > MAX_CHUNK_HEIGHT:
-                    chunks.append((cur, cur_f))
+                    chunks.append((cur, cur_f, cur_n))
                     cur = []
                     cur_f = set()
+                    cur_n = 0
                     cur_h = 0
                     add = img.height
                 cur.append(img)
                 cur_f = cur_f | fset
+                cur_n += n_boxes
                 cur_h += add
             if cur:
-                chunks.append((cur, cur_f))
+                chunks.append((cur, cur_f, cur_n))
 
             # 4. Render + save each chunk; resolve its footer page set.
             chunk_descs = []
-            for i, (imgs, fset) in enumerate(chunks):
+            for i, (imgs, fset, n_boxes) in enumerate(chunks):
                 w = max(im.width for im in imgs)
                 h = sum(im.height for im in imgs) + PADDING * (len(imgs) - 1)
                 canvas = Image.new('RGB', (w, h), color='white')
@@ -3479,7 +5517,10 @@ class LedgerGUI:
                 footer_pages = None
                 if fset and all(isinstance(f, int) and 0 < f < 999 for f in fset):
                     footer_pages = sorted(fset)
-                chunk_descs.append({"path": out_path, "footer_pages": footer_pages})
+                # [PATCH:count-check] box_count rides on the descriptor so the
+                # count check can compare reply items against boxes sent.
+                chunk_descs.append({"path": out_path, "footer_pages": footer_pages,
+                                    "box_count": n_boxes})
 
             self.log_message(f"    -> Stitched {len(snippet_paths)} snippets across {len(page_imgs)} page(s) "
                              f"into {len(chunk_descs)} chunk(s) (page-aligned, <= {MAX_CHUNK_HEIGHT}px tall).")
@@ -3718,12 +5759,29 @@ class LedgerGUI:
             self.log_message(f"[!] Essay assembly error for {b_id}: {e}")
             return []
 
-    def extract_with_silo_1(self, header_path, footer_path):
-        # --- LOCAL OFFLINE OCR (FOOTER / PAGE NUMBER) ---
+    def read_footer_crop(self, footer_path, announce=True, scan_file=None, page_no=None):
+        """[PATCH:footer-reader] WO-COS2 T3: THE single footer reader. The
+        local footer OCR that lived inline in extract_with_silo_1, moved
+        VERBATIM (same Otsu threshold, same largest-contour rule, same > 500
+        area gate, same _read_boxed_digits(lo=1, hi=LEDGER_FOOTER_MAX_PAGE)).
+
+        Returns (page_num, outcome, raw):
+          page_num  the page number, or 999 when unreadable
+          outcome   'ok' | 'no_square' | 'rejected' | 'error'
+          raw       raw OCR text ('rejected'), exception text ('error'),
+                    else None/str of the value
+
+        announce=True logs failures, counts the attempt for the run summary
+        and saves the failed crop to Footer-Rejects. A caller probing a crop
+        (orientation check) passes announce=False and announces only the
+        final result via _footer_announce, so each page is counted once.
+        """
         # [PATCH:boxed-digit-ocr] was: boundingRect + bitwise_not, which
         # inverted the box rim into ink beside the digits (6/25 correct on
         # the Algebra 1 EOC sample; two silent misreads, 200 and 307).
         page_num = 999
+        outcome = "no_square"
+        raw = None
         try:
             footer_img = cv2.imread(footer_path)
             gray_f = cv2.cvtColor(footer_img, cv2.COLOR_BGR2GRAY)
@@ -3734,17 +5792,278 @@ class LedgerGUI:
                 c = max(contours, key=cv2.contourArea)
                 if cv2.contourArea(c) > 500:
                     hi = int(os.environ.get("LEDGER_FOOTER_MAX_PAGE", "99"))
+                    # [PATCH:footer-cap] WO-BM3 T3: a footer can only name
+                    # a page the MASTER has, so the accepted range is
+                    # capped at the master's page count (set in
+                    # initialize_silo_2_cache, before Pass 1 reads any
+                    # footer). A read above the cap is rejected -> 999 ->
+                    # the existing full-master fallback.
+                    # LEDGER_FOOTER_CAP_MASTER=0 restores the env-only cap.
+                    if os.environ.get("LEDGER_FOOTER_CAP_MASTER",
+                                      "1") != "0":
+                        _mpc = getattr(self, "_master_page_count", None)
+                        if isinstance(_mpc, int) and _mpc > 0:
+                            hi = min(hi, _mpc)
                     val, raw = _read_boxed_digits(gray_f, c, thresh_f, lo=1, hi=hi)
                     if val is None:
                         # A corrupt read is now REJECTED, not silently cast.
                         # int("307") used to sail straight through.
-                        self.log_message(
-                            f"    -> [!] Footer OCR rejected {raw!r} on "
-                            f"{os.path.basename(footer_path)} (page -> 999)")
+                        outcome = "rejected"
                     else:
                         page_num = val
+                        outcome = "ok"
         except Exception as e:
-            self.log_message(f"    -> [!] Local Page Number OCR Failed: {e}")
+            outcome = "error"
+            raw = str(e)
+        if announce:
+            self._footer_announce(footer_path, page_num, outcome, raw,
+                                  scan_file=scan_file, page_no=page_no)
+        return page_num, outcome, raw
+
+    def _footer_announce(self, footer_path, page_num, outcome, raw,
+                         scan_file=None, page_no=None):
+        """[PATCH:footer-reader] WO-COS2 T3: one announcement per page --
+        counts the attempt for the run summary, logs a failure in the
+        established wording, and saves the failed crop (exactly as the
+        reader saw it) to Footer-Rejects. LEDGER_FOOTER_DEBUG=0 disables
+        the saving only; logging stays."""
+        self._footers_attempted = getattr(self, "_footers_attempted", 0) + 1
+        if outcome == "ok":
+            self._footers_read = getattr(self, "_footers_read", 0) + 1
+            return
+        if outcome == "rejected":
+            self.log_message(
+                f"    -> [!] Footer OCR rejected {raw!r} on "
+                f"{os.path.basename(footer_path)} (page -> 999)")
+        elif outcome == "no_square":
+            self.log_message(
+                f"    -> [!] Footer OCR found no page-number square on "
+                f"{os.path.basename(footer_path)} (page -> 999)")
+        elif outcome == "error":
+            self.log_message(f"    -> [!] Local Page Number OCR Failed: {raw}")
+        if os.environ.get("LEDGER_FOOTER_DEBUG", "1") == "0":
+            return
+        try:
+            os.makedirs(FOOTER_REJECTS_DIR, exist_ok=True)
+            label_scan = scan_file if scan_file else os.path.basename(footer_path)
+            label_page = page_no if page_no is not None else "X"
+            dest = os.path.join(
+                FOOTER_REJECTS_DIR, f"{label_scan}-page{label_page}-{outcome}.png")
+            if os.path.exists(footer_path):
+                shutil.copy(footer_path, dest)
+        except Exception as e:
+            self.log_message(f"    -> [!] Could not save footer reject crop: {e}")
+
+    def _reset_pass1_run_state(self):
+        """[PATCH:pass1-pacing] WO-COS2 T5: per-run Pass 1 pacing/re-read
+        state, reset at the start of every run (called from start_ledger
+        with the other per-run resets)."""
+        self._pass1_slow_mode = False
+        self._pass1_id_reread_accepted = []
+        # [PATCH:box-rejects] WO-BM1 T5: per-run reject-saving tallies
+        self._box_rejects_saved = 0
+        self._id_rejects_saved = 0
+        # [PATCH:run-summary] WO-COS2 T6: raw Pass 1 tallies (the
+        # _box_map_notices pattern) + the printed-once summary state.
+        self._pass1_ran = False
+        self._run_summary_stats = None
+        self._run_stats = {"pages_scanned": 0, "blank_pages": 0,
+                           "pages_sorted": 0, "pages_per_student": {},
+                           "discards": [], "read_errors": []}
+
+    def _collect_run_summary_stats(self):
+        """[PATCH:run-summary] WO-COS2 T6: one JSON-safe snapshot of the
+        Pass 1 tallies, for the printer and for the batch job record (it
+        must survive a shutdown and RESUME). Master page count comes from
+        its own attribute set when the master is rendered -- NOT from
+        s2ctx_master_files, which is emptied when per-chunk context is off."""
+        raw = getattr(self, "_run_stats", None) or {}
+        students = []
+        roster = getattr(self, "roster", {}) or {}
+        for b_id in sorted(raw.get("pages_per_student", {}),
+                           key=lambda k: str(k)):
+            info = roster.get(b_id, {})
+            name = f"{info.get('last', 'Unknown')}, {info.get('first', 'Student')}"
+            students.append({"id": b_id, "name": name,
+                             "pages": raw["pages_per_student"][b_id]})
+        return {
+            "ran": bool(getattr(self, "_pass1_ran", False)),
+            "pages_scanned": raw.get("pages_scanned", 0),
+            "blank_pages": raw.get("blank_pages", 0),
+            "pages_sorted": raw.get("pages_sorted", 0),
+            "students": students,
+            "discards": list(raw.get("discards", [])),
+            "read_errors": list(raw.get("read_errors", [])),
+            "rereads": list(getattr(self, "_pass1_id_reread_accepted", [])),
+            "turned_upright": getattr(self, "_pages_turned_upright", 0),
+            "sideways": getattr(self, "_sideways_pages", 0),
+            "footers_read": getattr(self, "_footers_read", 0),
+            "footers_attempted": getattr(self, "_footers_attempted", 0),
+            "footer_saving": os.environ.get("LEDGER_FOOTER_DEBUG", "1") != "0",
+            "master_pages": getattr(self, "_master_page_count", None),
+            "grading_mode": getattr(self, "grading_mode", "boxed"),
+        }
+
+    def _pass1_pause(self):
+        """[PATCH:pass1-pacing] WO-COS2 T5: the per-page Pass 1 pause.
+        LEDGER_PASS1_PACING_S seconds (default 3) -- setting it to 30
+        restores today's timing. After any Silo 1 capacity error this run,
+        LEDGER_PASS1_SLOW_PACING_S seconds (default 30) for the rest of the
+        run. Sleeps in 1 s slices so STOP stays responsive."""
+        try:
+            pace = float(os.environ.get("LEDGER_PASS1_PACING_S", "3"))
+        except (TypeError, ValueError):
+            pace = 3.0
+        if getattr(self, "_pass1_slow_mode", False):
+            try:
+                pace = float(os.environ.get("LEDGER_PASS1_SLOW_PACING_S", "30"))
+            except (TypeError, ValueError):
+                pace = 30.0
+        slept = 0.0
+        while slept < pace and self.is_running:
+            time.sleep(min(1.0, pace - slept))
+            slept += 1.0
+
+    def _pass1_note_capacity_error(self, err):
+        """[PATCH:pass1-pacing] WO-COS2 T5: a Silo 1 capacity error flips
+        this run into slow pacing, announced ONCE."""
+        if not pass1_capacity_error(str(err).lower()):
+            return
+        if getattr(self, "_pass1_slow_mode", False):
+            return
+        self._pass1_slow_mode = True
+        try:
+            slow = int(float(os.environ.get("LEDGER_PASS1_SLOW_PACING_S", "30")))
+        except (TypeError, ValueError):
+            slow = 30
+        self.log_message(
+            f"High traffic reported by the provider. Pass 1 will pause "
+            f"{slow} seconds between pages for the rest of this run.")
+
+    def _pass1_resolve_id(self, silo_data, temp_id_path, temp_footer_path,
+                          footer_result, pdf_file, page_display):
+        """[PATCH:id-reask] WO-COS2 T5: ONE re-read of an off-roster ID
+        (same crop, same prompt, after the normal pause). Returns
+        (silo_data, b_id) when a read is on the roster, else (None, None)
+        -> the caller discards the page. LEDGER_ID_REASK=0 restores the
+        immediate discard exactly."""
+        b_id = str(silo_data.get("bartonian_id", 0))
+        if b_id in self.roster:
+            return silo_data, b_id
+        if os.environ.get("LEDGER_ID_REASK", "1") == "0":
+            self.log_message(f"  -> [!] Invalid/missing ID ({b_id}). Discarding page.")
+            self._run_stats_discard(pdf_file, page_display, b_id, None)
+            # [PATCH:box-rejects] WO-BM1 T5: keep the discarded page's ID crop
+            self._id_save_reject(temp_id_path, pdf_file, page_display, b_id)
+            return None, None
+        self._pass1_pause()
+        silo_data2 = self.extract_with_silo_1(
+            temp_id_path, temp_footer_path, footer_result=footer_result)
+        b_id2 = str(silo_data2.get("bartonian_id", 0)) if silo_data2 else "0"
+        if silo_data2 and b_id2 in self.roster:
+            self.log_message(
+                f"  -> ID re-read on page {page_display} of {pdf_file}: "
+                f"first read {b_id} is not on the roster; second read {b_id2} "
+                f"accepted. Please verify.")
+            if not hasattr(self, "_pass1_id_reread_accepted"):
+                self._pass1_id_reread_accepted = []
+            self._pass1_id_reread_accepted.append(
+                {"file": pdf_file, "page": page_display,
+                 "first": b_id, "second": b_id2})
+            return silo_data2, b_id2
+        self.log_message(
+            f"  -> [!] Invalid/missing ID (read {b_id}, re-read {b_id2}). "
+            f"Discarding page {page_display} of {pdf_file}.")
+        self._run_stats_discard(pdf_file, page_display, b_id, b_id2)
+        # [PATCH:box-rejects] WO-BM1 T5: keep the discarded page's ID crop
+        # (named by the FIRST read; the re-read value is in the log and the
+        # run summary)
+        self._id_save_reject(temp_id_path, pdf_file, page_display, b_id)
+        return None, None
+
+    def _run_stats_discard(self, pdf_file, page_display, first, second):
+        """[PATCH:run-summary] WO-COS2 T6: record a discarded page for the
+        end-of-run summary (second is None when the re-read was disabled)."""
+        raw = getattr(self, "_run_stats", None)
+        if raw is not None:
+            raw.setdefault("discards", []).append(
+                {"file": pdf_file, "page": page_display,
+                 "first": first, "second": second})
+
+    def _auto_orient_page(self, temp_full_img_path, img_for_crop, scan_file,
+                          page_no, total_pages):
+        """[PATCH:auto-orient] WO-COS2 T4: local 180-degree upside-down
+        correction, Pass 1 only, zero API calls. Returns
+        (img_for_crop, footer_result):
+
+          footer_result  (page_num, outcome, raw) when this method already
+                         read the footer (announced once, so the page is
+                         counted once); None when the caller must crop and
+                         read the footer itself (kill switch off-state or a
+                         sideways page -- today's flow exactly).
+
+        Upright page: the footer (calibrated crop_footer window) reads a
+        valid page number on the first try; the page file on disk is NOT
+        rewritten. Unreadable: the full page is rotated 180 in memory and
+        the same window re-read; a valid read means the page was upside
+        down -- the temp PNG is overwritten so EVERYTHING downstream (ID
+        crop, footer, box finder, box map, essay pages, conspectus scan
+        pages) uses the upright page. Neither read: left exactly as
+        scanned (the T3 footer failure line is the only alarm). Sideways
+        (wider than tall): left as scanned, no rotation attempt.
+        Kill switch: LEDGER_AUTO_ORIENT=0 skips all of this."""
+        if os.environ.get("LEDGER_AUTO_ORIENT", "1") == "0":
+            return img_for_crop, None
+        h_img, w_img = img_for_crop.shape[:2]
+        if w_img > h_img:
+            self.log_message(
+                f"  -> Page {page_no}/{total_pages} is sideways; left as scanned.")
+            self._sideways_pages = getattr(self, "_sideways_pages", 0) + 1
+            return img_for_crop, None
+        f_coords = self.get_crop_coordinates('crop_footer')
+        safe_scan_name = os.path.basename(temp_full_img_path).replace(
+            "-temp-full-page-", "-temp-footer-")
+        probe_path = os.path.join(os.path.dirname(temp_full_img_path), safe_scan_name)
+        as_scanned_crop = img_for_crop[f_coords[1]:f_coords[1] + f_coords[3],
+                                       f_coords[0]:f_coords[0] + f_coords[2]]
+        cv2.imwrite(probe_path, as_scanned_crop)
+        res_upright = self.read_footer_crop(probe_path, announce=False)
+        if res_upright[1] == "ok":
+            # Upright: page file untouched (byte-identical). Count the read.
+            self._footer_announce(probe_path, *res_upright,
+                                  scan_file=scan_file, page_no=page_no)
+            return img_for_crop, res_upright
+        rotated = cv2.rotate(img_for_crop, cv2.ROTATE_180)
+        rotated_crop = rotated[f_coords[1]:f_coords[1] + f_coords[3],
+                               f_coords[0]:f_coords[0] + f_coords[2]]
+        cv2.imwrite(probe_path, rotated_crop)
+        res_rotated = self.read_footer_crop(probe_path, announce=False)
+        if res_rotated[1] == "ok":
+            cv2.imwrite(temp_full_img_path, rotated)
+            self.log_message(
+                f"  -> Page {page_no}/{total_pages} was upside down; "
+                f"turned upright locally.")
+            self._pages_turned_upright = getattr(self, "_pages_turned_upright", 0) + 1
+            self._footer_announce(probe_path, *res_rotated,
+                                  scan_file=scan_file, page_no=page_no)
+            return rotated, res_rotated
+        # Neither read: leave the page exactly as scanned; restore the
+        # as-scanned footer crop on disk and announce ITS failure (one
+        # footer line, one reject crop, exactly the page as the run sees it).
+        cv2.imwrite(probe_path, as_scanned_crop)
+        self._footer_announce(probe_path, *res_upright,
+                              scan_file=scan_file, page_no=page_no)
+        return img_for_crop, res_upright
+
+    def extract_with_silo_1(self, header_path, footer_path, footer_result=None):
+        # --- LOCAL OFFLINE OCR (FOOTER / PAGE NUMBER) ---
+        # [PATCH:footer-reader] WO-COS2 T3: the OCR itself lives in
+        # read_footer_crop. A caller that already read this crop passes the
+        # result in and the footer is never OCR'd twice; absent, this
+        # behaves exactly as before.
+        if footer_result is None:
+            footer_result = self.read_footer_crop(footer_path)
+        page_num = footer_result[0]
 
         # --- GEMINI API (BARTONIAN ID ONLY) ---
         delay = 15
@@ -3775,7 +6094,7 @@ class LedgerGUI:
                     "image_b64": base64_header
                 }
                 
-                response = requests.post("http://127.0.0.1:5000/api/silo1", json=payload, timeout=60)
+                response = requests.post(DAEMON_BASE + "/api/silo1", json=payload, timeout=60)
                 self._raise_daemon_error(response)
                 data = response.json()
                 
@@ -3788,6 +6107,11 @@ class LedgerGUI:
                     raise Exception(data.get("message", "Daemon returned an error."))
                 
             except Exception as e:
+                # [PATCH:pass1-pacing] WO-COS2 T5: a capacity error flips the
+                # run to slow pacing (flag + one log line). The retry loop
+                # itself is unchanged -- it still retries until it succeeds,
+                # which is what guarantees a 429 never costs a page.
+                self._pass1_note_capacity_error(e)
                 logging.info(f"[!] Silo 1 Error. Retrying in {delay} seconds... Details: {e}")
                 friendly_err = self._translate_api_error(e)
                 self.root.after(0, self._append_to_gui, f"Silo 1 Status: {friendly_err} (Retrying in {delay}s)")
@@ -3903,9 +6227,161 @@ class LedgerGUI:
             result = self.evaluate_grid_with_silo_2(cp)
             if result is None:
                 return None  # capacity-deferred or Stop -> defer the whole student
+            # [PATCH:count-check] boxed chunks (dict descriptors) get the box
+            # count verified before the merge; None defers the whole student,
+            # exactly like a failed grading call. Essay mode never produces a
+            # dict descriptor, so it is untouched.
+            if isinstance(result, list) and isinstance(cp, dict):
+                result = self._count_check_chunk(cp, result)
+                if result is None:
+                    return None
             if isinstance(result, list):
                 merged.extend(result)
         return merged
+
+    def _count_check_chunk(self, chunk_desc, items):
+        """[PATCH:count-check] WO-B1: compare the number of items a chunk's
+        reply returned with the number of answer boxes sent.
+
+          * equal -> pass; more -> accept with one log line (not a drop).
+          * fewer -> either a dropped question or a deliberate omission
+            (lab-sheet data boxes the instructions say not to score). The run
+            works it out: a short set already learned for these pages passes;
+            otherwise re-ask live with the identical request (up to
+            LEDGER_COUNT_CHECK_REASKS, default 2). A complete reply, or two
+            replies agreeing on the same item set, is accepted; two agreeing
+            short replies are remembered for these pages for the rest of the
+            run. No agreement and no complete reply -> return None, which
+            defers the student through the existing path. A score with a
+            silently dropped question is never committed.
+
+        LEDGER_COUNT_CHECK=0 in the launcher environment disables the check.
+        Chunks whose printed page numbers could not be read still get the
+        re-ask logic, but nothing is learned from them. A learned pattern is
+        never replaced by a smaller one; a later student whose two replies
+        agree on fewer items is accepted for that student only."""
+        if os.environ.get("LEDGER_COUNT_CHECK", "1") == "0":
+            return items
+        boxes = chunk_desc.get("box_count") if isinstance(chunk_desc, dict) else None
+        if not boxes:
+            return items  # nothing recorded to check against
+        learned = getattr(self, "_count_check_learned", None)
+        if learned is None:
+            learned = self._count_check_learned = {}
+        fp = chunk_desc.get("footer_pages")
+        pages_key = tuple(fp) if fp else None
+        label = count_check_pages_label(fp)
+        try:
+            reasks = int(os.environ.get("LEDGER_COUNT_CHECK_REASKS", "2"))
+        except (TypeError, ValueError):
+            reasks = 2
+
+        reply = items
+        seen_sets = []
+        attempt = 0
+        while True:
+            nums = count_check_item_list(reply)
+            n = len(nums)
+            s = frozenset(nums)
+            if len(s) < n:
+                # Duplicates within one reply: warning only, never a failure.
+                dups = sorted({x for x in nums if nums.count(x) > 1})
+                self.log_message(f"    -> [COUNT CHECK] WARNING ({label}): "
+                                 f"duplicate item number(s) in one reply: {dups}.")
+            if n == boxes:
+                if attempt:
+                    self.log_message(f"    -> [COUNT CHECK] {label}: complete reply "
+                                     f"({n} of {boxes} boxes) on re-ask - accepted.")
+                return reply
+            if n > boxes:
+                self.log_message(f"    -> [COUNT CHECK] {label}: reply returned {n} "
+                                 f"items for {boxes} boxes - accepted (not a drop).")
+                return reply
+            # Fewer items than boxes.
+            if pages_key is not None and learned.get(pages_key) == s:
+                self.log_message(f"    -> [COUNT CHECK] {label}: short reply matches "
+                                 f"the pattern learned for these pages - accepted.")
+                return reply
+            if s in seen_sets:
+                missing = boxes - n
+                if pages_key is not None:
+                    prev = learned.get(pages_key)
+                    if prev is None or len(s) >= len(prev):
+                        learned[pages_key] = s
+                        self.log_message(f"{label}: {missing} box(es) not scored on "
+                                         f"two tries; treated as data boxes. Please verify.")
+                    else:
+                        self.log_message(f"    -> [COUNT CHECK] {label}: two replies "
+                                         f"agree on fewer items than the learned pattern - "
+                                         f"accepted for this student only.")
+                else:
+                    self.log_message(f"    -> [COUNT CHECK] {label}: two replies agree "
+                                     f"on the same short set - accepted (pages unreadable, "
+                                     f"nothing learned).")
+                return reply
+            seen_sets.append(s)
+            if attempt >= reasks:
+                self.log_message(f"    -> [COUNT CHECK] {label}: reply covered {n} of "
+                                 f"{boxes} boxes and re-asks are exhausted - this student "
+                                 f"will be deferred, never scored short.")
+                return None
+            attempt += 1
+            self.log_message(f"    -> [COUNT CHECK] {label}: reply covered {n} of "
+                             f"{boxes} boxes - asking again ({attempt} of {reasks}).")
+            reply = self.evaluate_grid_with_silo_2(chunk_desc)
+            if reply is None:
+                return None
+            if not isinstance(reply, list):
+                reply = []
+
+    def _parse_silo2_text(self, text):
+        """[PATCH:batch] The ONE parse choke point for a Silo 2 reply text,
+        shared by the live path and batch collection: strip ```json fences,
+        json_repair-parse, then normalize the literal \\n\\n sequence.
+
+        [PATCH:literal-newline-normalize] Some models (first seen:
+        claude-opus-4-8) obey the prompt's backslash-doubling rule so
+        literally that paragraph breaks arrive as the LITERAL 4-char
+        sequence \\n\\n instead of a real blank line. Downstream, the
+        paragraph splitter (re.split on real blank lines) then finds
+        no paragraphs, and TeX tokenizes '\\n\\nThe' as undefined
+        control words -- eating the break AND the first word of the
+        next paragraph. Normalize ONLY the doubled sequence here, at
+        the single parse choke point, so the DB, Tabula, and report
+        all store clean text. Real newlines (Gemini's output) contain
+        no literal \\n\\n, so this is a byte-level no-op on the Google
+        route; no legitimate LaTeX in the loaded packages can produce
+        the sequence either (no macro named \\n exists)."""
+        raw = text.strip().replace('```json', '').replace('```', '').strip()
+        parsed = json_repair.loads(raw)
+        if isinstance(parsed, list):
+            for _it in parsed:
+                if isinstance(_it, dict) and isinstance(_it.get("student_answer"), str):
+                    _it["student_answer"] = _it["student_answer"].replace("\\n\\n", "\n\n")
+        return parsed
+
+    def _batch_capability_check(self, model_name):
+        """[PATCH:batch] Can the chosen model's route submit a batch through
+        this daemon? Returns (ok, note). An older daemon (no batch_endpoints
+        flag) or an unsupported route gives a clear refusal, never a crash
+        and never a silent fallback to live."""
+        try:
+            health = requests.get(DAEMON_BASE + "/", timeout=10).json()
+        except Exception as e:
+            return False, f"The scoring daemon is not reachable ({e})."
+        if not health.get("batch_endpoints"):
+            return False, ("This machine's scoring daemon predates batch "
+                           "scoring (needs v2.11). Update and restart "
+                           "ledger-daemon.service.")
+        m = (model_name or "").lower()
+        route = ("anthropic" if (m.startswith("claude") or "anthropic/" in m
+                                 or m.startswith("publishers/anthropic"))
+                 else "google")
+        cap = (health.get("batch") or {}).get(route) or {}
+        if not cap.get("supported"):
+            return False, (cap.get("reason")
+                           or f"The {route} route cannot submit batches here.")
+        return True, cap.get("reason")
 
     def evaluate_grid_with_silo_2(self, grid_image_path):
         """Sends ONLY the stitched grid. Context is pulled from daemon cache.
@@ -3950,24 +6426,12 @@ class LedgerGUI:
                 else:
                     image_payload = {"image_b64": self.image_to_base64_png(grid_image_path)}
 
-                evaluation_schema = {
-                    "type": "ARRAY",
-                    "items": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "item_number": {"type": "STRING"},
-                            "student_answer": {"type": "STRING"},
-                            "status": {"type": "STRING"},
-                            "feedback": {"type": "STRING"},
-                            "points_earned": {"type": "NUMBER"}
-                        },
-                        "required": ["item_number", "student_answer", "status", "feedback", "points_earned"]
-                    }
-                }
-
+                # [PATCH:batch] prompt line and schema moved VERBATIM to the
+                # module constants SILO2_PROMPT / EVALUATION_SCHEMA so the
+                # batch path sends the identical model-facing text.
                 payload = {
-                    "prompt":"Evaluate this grid of answers based strictly on your cached instructions.",
-                    "schema": evaluation_schema
+                    "prompt": SILO2_PROMPT,
+                    "schema": EVALUATION_SCHEMA
                 }
                 payload.update(image_payload)
                 # [PATCH:silo2-per-chunk-context] attach this chunk's own master
@@ -3976,31 +6440,15 @@ class LedgerGUI:
                 if master_ctx_b64:
                     payload["master_images_b64"] = master_ctx_b64
 
-                response = requests.post("http://127.0.0.1:5000/api/silo2", json=payload, timeout=(10, float(os.environ.get("LEDGER_SILO2_CLIENT_TIMEOUT_S", "330"))))  # [PATCH:client-timeout-coherence] read must OUTWAIT the daemon's 300s upstream budget; 2026-07-08 journal: real Fable 5 essay grades ran 121-151s and were discarded at the old 120s hang-up
+                response = requests.post(DAEMON_BASE + "/api/silo2", json=payload, timeout=(10, float(os.environ.get("LEDGER_SILO2_CLIENT_TIMEOUT_S", "330"))))  # [PATCH:client-timeout-coherence] read must OUTWAIT the daemon's 300s upstream budget; 2026-07-08 journal: real Fable 5 essay grades ran 121-151s and were discarded at the old 120s hang-up
                 self._raise_daemon_error(response)
                 data = response.json()
 
                 if data.get("status") == "success":
-                    raw = data["text"].strip().replace('```json', '').replace('```', '').strip()
-                    parsed = json_repair.loads(raw)
-                    # [PATCH:literal-newline-normalize] Some models (first seen:
-                    # claude-opus-4-8) obey the prompt's backslash-doubling rule so
-                    # literally that paragraph breaks arrive as the LITERAL 4-char
-                    # sequence \n\n instead of a real blank line. Downstream, the
-                    # paragraph splitter (re.split on real blank lines) then finds
-                    # no paragraphs, and TeX tokenizes '\n\nThe' as undefined
-                    # control words -- eating the break AND the first word of the
-                    # next paragraph. Normalize ONLY the doubled sequence here, at
-                    # the single parse choke point, so the DB, Tabula, and report
-                    # all store clean text. Real newlines (Gemini's output) contain
-                    # no literal \n\n, so this is a byte-level no-op on the Google
-                    # route; no legitimate LaTeX in the loaded packages can produce
-                    # the sequence either (no macro named \n exists).
-                    if isinstance(parsed, list):
-                        for _it in parsed:
-                            if isinstance(_it, dict) and isinstance(_it.get("student_answer"), str):
-                                _it["student_answer"] = _it["student_answer"].replace("\\n\\n", "\n\n")
-                    return parsed
+                    # [PATCH:batch] fence-stripping, json_repair and the
+                    # literal-\n\n normalization live in _parse_silo2_text so
+                    # batch collection parses results IDENTICALLY.
+                    return self._parse_silo2_text(data["text"])
                 else:
                     raise Exception(data.get("message"))
 
@@ -4088,10 +6536,10 @@ class LedgerGUI:
         tex_filename = f"{b_id}-{student_data['last']}-{student_data['first']}-Conspectus.tex"
         tex_path = os.path.join(output_dir, tex_filename)
         
-        tex_content = f"\\documentclass[12pt]{{article}}\n"
+        tex_content = f"\\documentclass[11pt]{{article}}\n"
         tex_content += f"\\usepackage{{fontspec}}\n"
         tex_content += f"\\setmainfont{{Liberation Serif}}\n"
-        tex_content += f"\\usepackage[margin=1in]{{geometry}}\n"
+        tex_content += f"\\usepackage[margin=0.85in]{{geometry}}\n"
         tex_content += f"\\usepackage{{graphicx}}\n"
         tex_content += f"\\usepackage{{eso-pic}}\n"
         tex_content += f"\\usepackage[version=4]{{mhchem}}\n"
@@ -4147,6 +6595,24 @@ class LedgerGUI:
         tex_content += f"\\begin{{document}}\n"
         tex_content += f"\\AddToShipoutPictureFG{{\\BackgroundPic}}\n\n"
 
+        # [PATCH:cos2b-sep] WO-COS2b: when feedback ends in a display
+        # equation the separator cancels \belowdisplayskip (see
+        # item_separator below) -- but LaTeX uses the SHORT display skips
+        # instead whenever the line before the display is short (measured:
+        # that is the common case), so above/below must each be equal to
+        # its short variant for the cancellation to be exact either way.
+        # [PATCH:cos2b-dskip] WO-COS2b commit 2: all four display skips set
+        # to a modest 4pt (defaults at 11pt: 11pt/6.5pt, and 0pt ABOVE a
+        # display after a short line -- the equation nearly touched the
+        # "Answer:" line while wasting space everywhere else). Equations
+        # stay centred; only the glue around them changes. Set AFTER
+        # \begin{document} because \normalsize (run at \begin{document})
+        # resets the display skips.
+        tex_content += f"\\abovedisplayskip=4pt plus 1pt minus 1pt\n"
+        tex_content += f"\\belowdisplayskip=4pt plus 1pt minus 1pt\n"
+        tex_content += f"\\abovedisplayshortskip=4pt plus 1pt minus 1pt\n"
+        tex_content += f"\\belowdisplayshortskip=4pt plus 1pt minus 1pt\n\n"
+
         tex_content += f"\\noindent\\textbf{{Name:}} {safe_tex_name}\\\\\n"
         tex_content += f"\\textbf{{Assignment:}} {safe_tex_title}\\\\\n"
         
@@ -4154,8 +6620,17 @@ class LedgerGUI:
         raw_label = self.get_custom_id_label()
         safe_tex_label = raw_label.replace('&', '\\&').replace('%', '\\%').replace('#', '\\#').replace('_', '\\_')
         tex_content += f"\\textbf{{{safe_tex_label}: }} {b_id}\\\\\n"
-        tex_content += f"\\textbf{{Final Score: }} {format_score(score)}/{format_score(max_score)}\n"
-        tex_content += f"\\vspace{{1cm}}\n\n"
+        # [PATCH:cosmetics] WO-COS1 T1: Final Score renders \large, and one
+        # thin full-width rule closes the header. Nothing else moves.
+        tex_content += f"{{\\large\\textbf{{Final Score: }} {format_score(score)}/{format_score(max_score)}}}\\par\n"
+        # [PATCH:cos2b-sep] WO-COS2b: the old trailing "\vspace{0.5cm}" was
+        # issued in HORIZONTAL mode after the full-width rule, so the
+        # paragraph broke into an empty second line carrying a whole
+        # \baselineskip on top of the 0.5cm (measured: 28.6pt of white
+        # under the header rule). \par first, \nointerlineskip (the next
+        # element gets no interline glue), then a vertical-mode 10pt.
+        tex_content += f"\\noindent\\rule{{\\textwidth}}{{0.4pt}}\\par\\nopagebreak\\nointerlineskip\n"
+        tex_content += f"\\vspace{{10pt}}\n\n"
 
         # [PATCH:ss-conspectus] Unselected optional prompts collapse into ONE
         # neutral gray line -- never a wall of red INCORRECTs for a student who
@@ -4184,7 +6659,11 @@ class LedgerGUI:
         _one_item_per_page = getattr(self, "grading_mode", "boxed") == "essay"
         _first_graded_item = True
 
-        for item in graded_items:
+        for _gi_idx, item in enumerate(graded_items):
+            # [PATCH:cosmetics] WO-COS1b T2b: the LAST graded item gets no
+            # trailing separator rule -- the \clearpage to the scan pages is
+            # the section break, and a rule can never land at a page boundary.
+            _is_last_graded = (_gi_idx == len(graded_items) - 1)
             if _one_item_per_page and not _first_graded_item:
                 tex_content += "\\clearpage\n\n"
             _first_graded_item = False
@@ -4202,6 +6681,16 @@ class LedgerGUI:
             student_answer = str(item.get('student_answer', '')).strip().replace('\r\n', '\n')
             feedback = str(item.get('feedback', '')).strip()
             item_number = str(item.get('item_number', '')).strip()
+
+            # [PATCH:cosmetics] WO-COS2 T2: verdict line = plain black item
+            # number OUTSIDE the \textcolor (the overflow wrapper's breakable
+            # branch hooks \textcolor, so the body's ONE \textcolor must wrap
+            # only the colored status text), then colored, regular-weight
+            # status + points. Points pluralized on the formatted value
+            # (1 -> "pt").
+            _pts_str = format_score(points)
+            _pts_unit = "pt" if _pts_str == "1" else "pts"
+            status_line = f"{item_number}~~\\textcolor{{{color}}}{{{status} · {_pts_str} {_pts_unit}}}"
 
             # [PATCH:ss-paragraphs] Essay-length transcriptions keep the student's
             # paragraph structure (blank-line separated in the JSON string) and
@@ -4221,15 +6710,50 @@ class LedgerGUI:
             is_essay = (getattr(self, "grading_mode", "boxed") == "essay") and \
                        (len(paragraphs) > 1 or len(student_answer) > 600)
 
+            # [PATCH:cosmetics] WO-COS1 T1 / [PATCH:cos2b-sep] WO-COS2b: item
+            # separator = a thin light-gray rule with a sliver of space each
+            # side. The rule is a vertical-mode \hrule, NOT a \rule text
+            # line: a text line carries \baselineskip interline glue above
+            # it, and a trailing \vspace issued in horizontal mode broke the
+            # paragraph into an empty extra line below it (measured 16.3pt /
+            # 20.4pt of white; now ~6pt each side -- TeX inserts no
+            # interline glue around rules). When the feedback ends in a
+            # display equation, the glue LaTeX already hung below the
+            # display is cancelled first (\belowdisplayshortskip is
+            # equalized to \belowdisplayskip at \begin{document}, so the
+            # dimexpr cancels whichever one applied). The rule keeps \color
+            # INSIDE a group, never \textcolor: the overflow wrapper's
+            # breakable branch hooks \textcolor to pin a page-break penalty
+            # to the ONE status line, so the body must contain exactly one
+            # \textcolor. Side-effect-free (glue/penalty/rule only; no
+            # labels/counters), so a too-tall \BODY can still be typeset
+            # twice. Page breaks: the \nopagebreak penalty forbids a break
+            # between an item's last line and its rule; the only legal
+            # breakpoint is at the glue AFTER the rule (glue preceded by a
+            # rule), so the rule can never be orphaned from the item it
+            # closes.
+            _fb_tail = feedback.rstrip()
+            _ends_in_display = _fb_tail.endswith("\\]") or _fb_tail.endswith("$$")
+            _sep_space_above = (
+                "\\vspace{\\dimexpr-\\belowdisplayskip+6pt\\relax}"
+                if _ends_in_display else "\\vspace{6pt}"
+            )
+            item_separator = (
+                f"\\par\\nopagebreak{_sep_space_above}\n"
+                "{\\color{gray!40}\\hrule height 0.4pt}\n"
+                "\\vspace{5pt}\n"
+            )
+
             if is_essay:
                 answer_body = "\n\\par\\smallskip\n".join(paragraphs)
-                tex_content += f"\\noindent\\textbf{{{item_number}}} Student Answer:\n"
-                # [PATCH:overflow-stickiness] (WO-A4) \nopagebreak: the label
-                # line is never last on a page. \needspace + \\*: the STATUS
-                # line always has the first feedback line with it, so neither
-                # STATUS nor a lone "Feedback:" is ever stranded at a page
-                # bottom. Visible diff vs pre-A4: an essay that used to break
-                # at one of these seams now breaks a line earlier.
+                # [PATCH:cosmetics] WO-COS1 T1: STATUS line comes FIRST. \\*
+                # keeps the "Answer:" lead-in on the status line's page and
+                # \nopagebreak keeps the quotation's first line with it, so
+                # the status line is never alone at a page bottom; the
+                # quotation block itself stays page-breakable. \needspace
+                # still keeps "Feedback:" off a page's last line.
+                tex_content += f"\\noindent{status_line} \\\\*[3pt]\n"
+                tex_content += f"Answer:\n"
                 tex_content += f"\\nopagebreak\n"
                 # [PATCH:essay-first-indent] The quotation environment indents
                 # EVERY paragraph by default; the old explicit \noindent here
@@ -4238,20 +6762,21 @@ class LedgerGUI:
                 # quotation do its job -- all paragraphs now indent uniformly.
                 tex_content += f"\\begin{{quotation}}{answer_body}\\end{{quotation}}\n"
                 tex_content += f"\\needspace{{2\\baselineskip}}\n"
-                tex_content += f"\\noindent\\textbf{{\\textcolor{{{color}}}{{{status} [{format_score(points)} pts]}}}} \\\\*\n"
-                tex_content += f"\\textit{{Feedback:}} {feedback}\n"
-                tex_content += f"\\vspace{{0.5cm}}\n\n"
+                tex_content += f"\\noindent\\textit{{Feedback:}} {feedback}\n"
+                if not _is_last_graded:
+                    tex_content += item_separator
+                tex_content += "\n"
             else:
-                answer_newline = "" if student_answer.endswith("\\]") else " \\\\"
-                # [PATCH:overflow-wrapper] Only the two wrapper lines changed
-                # vs the pre-A4 minipage block; the body lines (including the
-                # \] answer_newline quirk) are byte-identical and shared by
-                # both renderings through \BODY.
+                answer_newline = "" if student_answer.endswith("\\]") else " \\\\[3pt]"
+                # [PATCH:overflow-wrapper] the \] answer_newline quirk is kept:
+                # a line break may not follow display math, so the Feedback
+                # line then starts its own paragraph instead.
                 tex_content += f"\\begin{{conspectusitem}}\n"
-                tex_content += f"\\textbf{{{item_number}}} Student Answer: {student_answer}{answer_newline}\n"
-                tex_content += f"\\textbf{{\\textcolor{{{color}}}{{{status} [{format_score(points)} pts]}}}} \\\\\n" # SURGICAL INSERTION: Print points
+                tex_content += f"{status_line} \\\\[3pt]\n"
+                tex_content += f"Answer: {student_answer}{answer_newline}\n"
                 tex_content += f"\\textit{{Feedback:}} {feedback}\n"
-                tex_content += f"\\vspace{{0.5cm}}\n"
+                if not _is_last_graded:
+                    tex_content += item_separator
                 tex_content += f"\\end{{conspectusitem}}\n\n"
             
         tex_content += "\\clearpage\n\n"
@@ -4262,7 +6787,10 @@ class LedgerGUI:
             tex_content += f"    \\includegraphics[width=\\paperwidth,height=\\paperheight]{{{img}}}%\n"
             tex_content += f"  }}%\n"
             tex_content += f"}}\n"
-            tex_content += f"\\mbox{{}}\\clearpage\n"
+            # [PATCH:cosmetics] WO-COS1b T2c: scan pages carry only the scan
+            # background and the watermark (an FG shipout picture, unaffected
+            # by page style) -- no page number.
+            tex_content += f"\\mbox{{}}\\thispagestyle{{empty}}\\clearpage\n"
             
         tex_content += "\\end{document}"
         
@@ -4388,6 +6916,26 @@ class LedgerGUI:
         pdf_to_period_map = {}
         tabula_records_by_eval_dir = {}
         
+        # [PATCH:footer-reader] WO-COS2 T3: empty Footer-Rejects at the START
+        # of Pass 1 (not at app startup) -- the previous run's crops stay
+        # available for diagnosis until the next run begins.
+        # [PATCH:box-rejects] WO-BM1 T5: Box-Rejects and ID-Rejects share
+        # that lifecycle.
+        for _rej_dir in (FOOTER_REJECTS_DIR, BOX_REJECTS_DIR, ID_REJECTS_DIR):
+            try:
+                if os.path.isdir(_rej_dir):
+                    for _fr_name in os.listdir(_rej_dir):
+                        _fr_path = os.path.join(_rej_dir, _fr_name)
+                        if os.path.isfile(_fr_path):
+                            os.remove(_fr_path)
+            except Exception as _fr_e:
+                self.log_message(f"[!] Could not empty "
+                                 f"{os.path.basename(_rej_dir)}: {_fr_e}")
+
+        # [PATCH:run-summary] WO-COS2 T6: Pass 1 is actually running -- the
+        # end-of-run summary prints only for runs that reached this point.
+        self._pass1_ran = True
+
         self.log_message(f"=== INITIATING LEDGER PASS 1: EXTRACTION & CROPPING ({len(pdf_files)} Files) ===")
         
         for pdf_file in pdf_files:
@@ -4396,11 +6944,16 @@ class LedgerGUI:
             self.log_message(f"Reading document: {pdf_file}")
             
             first_period_found = None
-                        
+            _pass1_err_page = 0  # [PATCH:run-summary] T6: last page being read
+
             try:
                 doc = fitz.open(pdf_path)
                 total_pages = len(doc)
-                
+                # [PATCH:run-summary] WO-COS2 T6: tally only, no flow change.
+                if hasattr(self, "_run_stats"):
+                    self._run_stats["pages_scanned"] = \
+                        self._run_stats.get("pages_scanned", 0) + total_pages
+
                 for page_num in range(total_pages):
                     if not self.is_running: break
                     
@@ -4414,34 +6967,76 @@ class LedgerGUI:
                     
                     pix.save(temp_full_img_path)
                     
+                    _pass1_err_page = page_num + 1  # [PATCH:run-summary] T6
+
                     if ImageStat.Stat(Image.open(temp_full_img_path).convert("L")).stddev[0] < 15.0:
                         self.log_message(f"  -> Page {page_num + 1}/{total_pages} is blank. Skipping.")
+                        if hasattr(self, "_run_stats"):  # [PATCH:run-summary] T6
+                            self._run_stats["blank_pages"] = \
+                                self._run_stats.get("blank_pages", 0) + 1
                         continue
                         
                     # THE FIX: Silo 1 now runs on every single page to catch out-of-order scans!
                     # 1. Dynamic Extraction of ID and Footer using locked Database Coordinates
                     img_for_crop = cv2.imread(temp_full_img_path)
-                    
+
+                    # [PATCH:auto-orient] WO-COS2 T4: correct an upside-down
+                    # page locally BEFORE anything is cropped or sent. When
+                    # the orient step read the footer, its result is reused
+                    # below -- an upright page costs ONE footer read, as
+                    # today. LEDGER_AUTO_ORIENT=0 restores today's flow.
+                    img_for_crop, oriented_footer_result = self._auto_orient_page(
+                        temp_full_img_path, img_for_crop, pdf_file,
+                        page_num + 1, total_pages)
+
                     id_coords = self.get_crop_coordinates('crop_id')
                     id_crop = img_for_crop[id_coords[1] : id_coords[1]+id_coords[3], id_coords[0] : id_coords[0]+id_coords[2]]
                     temp_id_path = os.path.join(TEMP_DIR, f"{safe_pdf_name}-temp-id-{page_num + 1}.png")
                     cv2.imwrite(temp_id_path, id_crop)
 
                     f_coords = self.get_crop_coordinates('crop_footer')
-                    footer_crop = img_for_crop[f_coords[1] : f_coords[1]+f_coords[3], f_coords[0] : f_coords[0]+f_coords[2]]
                     temp_footer_path = os.path.join(TEMP_DIR, f"{safe_pdf_name}-temp-footer-{page_num + 1}.png")
-                    cv2.imwrite(temp_footer_path, footer_crop)
+                    # [PATCH:auto-orient] WO-COS2 T4: when the orient step
+                    # already cropped + read this page's footer (same window,
+                    # same file), reuse its result -- never OCR twice.
+                    if oriented_footer_result is None:
+                        footer_crop = img_for_crop[f_coords[1] : f_coords[1]+f_coords[3], f_coords[0] : f_coords[0]+f_coords[2]]
+                        cv2.imwrite(temp_footer_path, footer_crop)
 
-                    # 2. Extract Data (Local OCR for Footer, API for ID)
-                    time.sleep(30) # Increased from 15 to 30 to prevent 429 quota exhaustion
-                    silo_data = self.extract_with_silo_1(temp_id_path, temp_footer_path)
-                    
+                        # 2. Extract Data (Local OCR for Footer, API for ID)
+                        # [PATCH:footer-reader] WO-COS2 T3: the footer is read
+                        # ONCE here and the result handed to extract_with_silo_1
+                        # (same single OCR per page as before).
+                        footer_result = self.read_footer_crop(
+                            temp_footer_path, scan_file=pdf_file, page_no=page_num + 1)
+                    else:
+                        footer_result = oriented_footer_result
+                    # [PATCH:pass1-pacing] WO-COS2 T5: was a hardcoded
+                    # time.sleep(30) ("to prevent 429 quota exhaustion" --
+                    # ~50 min of sleep per 100 pages against a 2,000 req/min
+                    # limit). Now LEDGER_PASS1_PACING_S (default 3), with an
+                    # automatic slow-down to LEDGER_PASS1_SLOW_PACING_S
+                    # (default 30) after any capacity error this run.
+                    self._pass1_pause()
+                    silo_data = self.extract_with_silo_1(temp_id_path, temp_footer_path, footer_result=footer_result)
+
                     if silo_data:
-                        b_id = str(silo_data.get("bartonian_id", 0))
-                        if b_id not in self.roster:
-                            self.log_message(f"  -> [!] Invalid/missing ID ({b_id}). Discarding page.")
+                        # [PATCH:id-reask] WO-COS2 T5: an off-roster ID gets
+                        # ONE re-read before the page is discarded.
+                        silo_data, b_id = self._pass1_resolve_id(
+                            silo_data, temp_id_path, temp_footer_path,
+                            footer_result, pdf_file, page_num + 1)
+                        if silo_data is None:
                             continue
-                            
+
+                        # [PATCH:run-summary] WO-COS2 T6: this page WILL be
+                        # appended to b_id below (both modes) -- tally it.
+                        if hasattr(self, "_run_stats"):
+                            self._run_stats["pages_sorted"] = \
+                                self._run_stats.get("pages_sorted", 0) + 1
+                            _pps = self._run_stats.setdefault("pages_per_student", {})
+                            _pps[b_id] = _pps.get(b_id, 0) + 1
+
                         if not first_period_found:
                             first_period_found = self.get_period_folder(b_id)
                             
@@ -4495,6 +7090,13 @@ class LedgerGUI:
                             })
                             
                             page_snippets = self.extract_boxes_with_opencv(temp_full_img_path, page_num + 1)
+                            # [PATCH:box-map] compare what the finder found
+                            # with the master's box map for this footer page;
+                            # recover (verified) or report any missing box.
+                            # Clean pages return UNTOUCHED (byte-identical).
+                            page_snippets = self._box_map_reconcile(
+                                page_snippets, b_id, silo_page_number,
+                                temp_full_img_path, page_num + 1)
                             assignment_ref["students"][b_id]["snippets"].extend(page_snippets)
                             # [PATCH:silo2-per-chunk-context] Record the FOOTER-derived
                             # master page number for every snippet cropped from this
@@ -4513,36 +7115,51 @@ class LedgerGUI:
                 
             except Exception as e:
                 self.log_message(f"[!] Error reading {pdf_file}: {e}")
+                # [PATCH:run-summary] WO-COS2 T6: LOGGING ONLY -- the
+                # try/except and the loop's control flow are unchanged.
+                if hasattr(self, "_run_stats"):
+                    self._run_stats.setdefault("read_errors", []).append(
+                        {"file": pdf_file, "page": _pass1_err_page})
                 continue
                 
+        # [PATCH:footer-reader] WO-COS2 T3: one visible line on how the
+        # footers fared, before the warnings scroll away.
+        _fa = getattr(self, "_footers_attempted", 0)
+        _fr = getattr(self, "_footers_read", 0)
+        if _fa:
+            self.log_message(footer_summary_line(
+                _fr, _fa,
+                saving_enabled=os.environ.get("LEDGER_FOOTER_DEBUG", "1") != "0"))
+
+        # [PATCH:box-rejects] WO-BM1 T5: one plain pointer per folder that
+        # received anything this run (the Footer-Rejects pattern).
+        if getattr(self, "_box_rejects_saved", 0):
+            self.log_message("Rejected box-recovery crops saved in "
+                             ".Diagnostic-Log/Box-Rejects.")
+        if getattr(self, "_id_rejects_saved", 0):
+            self.log_message("ID crops of discarded pages saved in "
+                             ".Diagnostic-Log/ID-Rejects.")
+
         # PASS 2: Evaluation & Conspectus Generation
         self.log_message("=== PASS 1 COMPLETE. INITIATING LEDGER PASS 2: BATCH EVALUATION ===")
-        
+
+        # [PATCH:batch] SCORING: BATCH submits Pass 2 through the provider's
+        # half-price batch services and collects the results; the loop below
+        # is the LIVE path, byte-identical to before.
+        if getattr(self, "scoring_mode", "live") == "batch":
+            try:
+                self._run_batch_pass2(global_batch_data, pdf_to_period_map,
+                                      tabula_records_by_eval_dir)
+            except Exception as e:
+                self.log_message(f"[!] BATCH scoring failed: {e}")
+                self.finish_processing()
+            return
+
         deferred_ids = set()  # [PATCH:silo2-bounded-retry] students skipped on capacity (429)
         for group_key, data in global_batch_data.items():
-            max_possible_score = data["max_possible_score"]
-            safe_title = data["display_title"]
-            
             for b_id, student_data in data["students"].items():
                 if not self.is_running: break
-                
-                period_folder = self.get_period_folder(b_id)
-                
-                # --- FOLDER NOMENCLATURE SURGERY ---
-                if period_folder == "Unknown-Student":
-                    folder_suffix = "-Unknown"
-                else:
-                    # Splits "7th Period" at the space and grabs just "7th"
-                    folder_suffix = f"-{period_folder.split()[0]}" 
-                    
-                # Append the suffix for the folder name, leaving safe_title intact for LaTeX
-                appended_folder_name = f"{safe_title}{folder_suffix}"
-                
-                eval_dir = os.path.join(COURSES_DIR, period_folder, "Evaluated Assignments", appended_folder_name)
-                # -----------------------------------
-                
-                os.makedirs(eval_dir, exist_ok=True)
-                
+
                 # [PATCH:essay-mode] Assemble the Silo 2 payload for this
                 # student. BOXED: stitched grid chunks (single image per call,
                 # unchanged). ESSAY: essay-aligned groups of resized full
@@ -4553,107 +7170,163 @@ class LedgerGUI:
                 else:
                     chunk_paths = self.stitch_snippets_to_grid(student_data["snippets"], b_id,
                                                                student_data.get("snippet_master_pages"))
-                
+
                 if not chunk_paths:
                     self.log_message(f"[!] No snippets found for {b_id}. Skipping evaluation.")
                     continue
 
-                # --- NEW RETRY LOOP INITIATED ---
-                max_attempts = 3
-                attempt = 1
-                compilation_success = False
-                
                 # Pre-sort original pages and pull student info outside the evaluation loop
                 student_data["full_pages"].sort(key=lambda x: x["lowest_q"])
                 sorted_page_paths = [page["path"] for page in student_data["full_pages"]]
                 student_info = self.roster.get(b_id, {"last": "Unknown", "first": "Student"})
 
-                while attempt <= max_attempts and self.is_running:
-                    self.log_message(f"Evaluating stitched grid for ID {b_id} via cached Silo 2 (Attempt {attempt} of {max_attempts})...")
-                    
-                    if attempt > 1:
-                        time.sleep(15) # Increased retry pacing
-                    else:
-                        time.sleep(30) # Increased to 30s to stay under TPM limits
-                        
-                    full_evaluation = self.evaluate_chunks_with_silo_2(chunk_paths)
-                    
-                    # [PATCH:silo2-bounded-retry] None == bounded retries exhausted on Google
-                    # capacity (429), OR the user pressed Stop. Defer this student: do NOT write
-                    # a zero grade or build a conspectus from empty results.
-                    if full_evaluation is None:
-                        if self.is_running:
-                            self.log_message(f"  -> [DEFERRED] ID {b_id}: grading call failed (see Silo 2 Detail above) - not graded. Scan retained for re-run.")
-                            deferred_ids.add(b_id)
-                        break  # leave the LaTeX-attempt loop for this student
-
-                    # NEW GUARD: Prevent fall-through crash on NoneType objects if API request fails
-                    if not isinstance(full_evaluation, list):
-                        full_evaluation = []
-                    
-                    # Post-evaluation sorting (Alphanumeric)
-                    if full_evaluation:
-                        prefix_map = {}
-                        for item in full_evaluation:
-                            m = re.match(r'^(\d+)([a-z]+)', str(item.get("item_number", "")).strip().lower())
-                            if m:
-                                prefix = int(m.group(1))
-                                prefix_map[prefix] = prefix_map.get(prefix, 0) + 1
-                        best_prefix = max(prefix_map.keys(), key=lambda k: prefix_map[k]) if prefix_map else 0
-                        
-                        def get_item_sort_key(item):
-                            s = str(item.get("item_number", "")).strip().lower()
-                            m_num = re.match(r'^(\d+)([a-z]*)', s)
-                            if m_num: return (int(m_num.group(1)), m_num.group(2))
-                            m_let = re.match(r'^([a-z]+)', s)
-                            if m_let: return (best_prefix if best_prefix > 0 else float('inf'), m_let.group(1))
-                            return (float('inf'), s)
-                        full_evaluation.sort(key=get_item_sort_key)
-                    
-                    earned_points = sum(item.get("points_earned", 0) for item in full_evaluation)
-                    self.log_message(f"  -> Score Computed: {format_score(earned_points)}/{format_score(max_possible_score)}")
-                    
-                    # NEW: Write the final score to the database
-                    self.write_grade_to_db(b_id, group_key, earned_points)
-                    
-                    # Conspectus generation with success tracking
-                    is_final = (attempt == max_attempts)
-                    compilation_success = self.generate_latex_conspectus(
-                        b_id, student_info, data["original_title"], earned_points, 
-                        max_possible_score, full_evaluation, sorted_page_paths, eval_dir,
-                        is_final_attempt=is_final
-                    )
-                    
-                    if compilation_success:
-                        break # Success! Exit the retry loop.
-                    else:
-                        self.log_message(f"[!] LaTeX Compilation Failed. Re-triggering Silo 2...")
-                        attempt += 1
-
+                # [PATCH:batch] the per-student finishing path is extracted
+                # into _finish_student so BATCH collection can reuse it
+                # unchanged; LIVE behavior is identical to before.
+                self._finish_student(group_key, data, b_id, student_info,
+                                     sorted_page_paths, chunk_paths,
+                                     tabula_records_by_eval_dir, deferred_ids)
                 if not self.is_running: break # Safety exit for shutdown button
 
-                # [PATCH:silo2-bounded-retry] Deferred students were never graded. Record
-                # them in the Tabula as DEFERRED so the teacher sees exactly who needs a
-                # re-run, then skip the normal score append below.
-                if b_id in deferred_ids:
-                    if eval_dir not in tabula_records_by_eval_dir:
-                        tabula_records_by_eval_dir[eval_dir] = []
-                    tabula_records_by_eval_dir[eval_dir].append({
-                        "last": student_info['last'], "first": student_info['first'],
-                        "b_id": b_id, "score_str": "DEFERRED"
-                    })
-                    continue
-                
-                # Tabula Generation proceeds with the final evaluation result
-                if eval_dir not in tabula_records_by_eval_dir:
-                    tabula_records_by_eval_dir[eval_dir] = []
-                tabula_records_by_eval_dir[eval_dir].append({
-                    "last": student_info['last'], "first": student_info['first'], 
-                    "b_id": b_id, "score_str": f"{format_score(earned_points)}/{format_score(max_possible_score)}"
-                })
-                
         # Tabula Generation
         if self.is_running:
+            self._write_tabulas(tabula_records_by_eval_dir)
+
+        # Original Scan Cleanup
+        self._move_scans(pdf_to_period_map, deferred_ids)
+
+        self.finish_processing()
+
+    def _finish_student(self, group_key, data, b_id, student_info,
+                        sorted_page_paths, chunk_paths,
+                        tabula_records_by_eval_dir, deferred_ids,
+                        first_evaluation=None):
+        """The per-student finishing path: evaluate, sort, score, write the
+        DB, build the conspectus (the existing 3-attempt loop that re-scores
+        LIVE on a compile failure), and append the Tabula record.
+
+        [PATCH:batch] Extracted verbatim from the Pass 2 loop so BATCH
+        collection finishes a student through the IDENTICAL code. With
+        first_evaluation set (the batch results), attempt 1 uses it without
+        the live pacing sleeps (pacing applies to live calls only); a failed
+        compile falls back to live re-scoring exactly as today."""
+        max_possible_score = data["max_possible_score"]
+        safe_title = data["display_title"]
+        period_folder = self.get_period_folder(b_id)
+
+        # --- FOLDER NOMENCLATURE SURGERY ---
+        if period_folder == "Unknown-Student":
+            folder_suffix = "-Unknown"
+        else:
+            # Splits "7th Period" at the space and grabs just "7th"
+            folder_suffix = f"-{period_folder.split()[0]}"
+
+        # Append the suffix for the folder name, leaving safe_title intact for LaTeX
+        appended_folder_name = f"{safe_title}{folder_suffix}"
+
+        eval_dir = os.path.join(COURSES_DIR, period_folder, "Evaluated Assignments", appended_folder_name)
+        # -----------------------------------
+
+        os.makedirs(eval_dir, exist_ok=True)
+
+        # --- NEW RETRY LOOP INITIATED ---
+        max_attempts = 3
+        attempt = 1
+        compilation_success = False
+
+        while attempt <= max_attempts and self.is_running:
+            self.log_message(f"Evaluating stitched grid for ID {b_id} via cached Silo 2 (Attempt {attempt} of {max_attempts})...")
+
+            if first_evaluation is not None and attempt == 1:
+                # [PATCH:batch] attempt 1 of a batch-collected student uses
+                # the already-fetched results; no pacing sleep (live only).
+                full_evaluation = first_evaluation
+            else:
+                if attempt > 1:
+                    time.sleep(15) # Increased retry pacing
+                else:
+                    time.sleep(30) # Increased to 30s to stay under TPM limits
+
+                full_evaluation = self.evaluate_chunks_with_silo_2(chunk_paths)
+
+            # [PATCH:silo2-bounded-retry] None == bounded retries exhausted on Google
+            # capacity (429), OR the user pressed Stop. Defer this student: do NOT write
+            # a zero grade or build a conspectus from empty results.
+            if full_evaluation is None:
+                if self.is_running:
+                    self.log_message(f"  -> [DEFERRED] ID {b_id}: grading call failed (see Silo 2 Detail above) - not graded. Scan retained for re-run.")
+                    deferred_ids.add(b_id)
+                break  # leave the LaTeX-attempt loop for this student
+
+            # NEW GUARD: Prevent fall-through crash on NoneType objects if API request fails
+            if not isinstance(full_evaluation, list):
+                full_evaluation = []
+
+            # Post-evaluation sorting (Alphanumeric)
+            if full_evaluation:
+                prefix_map = {}
+                for item in full_evaluation:
+                    m = re.match(r'^(\d+)([a-z]+)', str(item.get("item_number", "")).strip().lower())
+                    if m:
+                        prefix = int(m.group(1))
+                        prefix_map[prefix] = prefix_map.get(prefix, 0) + 1
+                best_prefix = max(prefix_map.keys(), key=lambda k: prefix_map[k]) if prefix_map else 0
+
+                def get_item_sort_key(item):
+                    s = str(item.get("item_number", "")).strip().lower()
+                    m_num = re.match(r'^(\d+)([a-z]*)', s)
+                    if m_num: return (int(m_num.group(1)), m_num.group(2))
+                    m_let = re.match(r'^([a-z]+)', s)
+                    if m_let: return (best_prefix if best_prefix > 0 else float('inf'), m_let.group(1))
+                    return (float('inf'), s)
+                full_evaluation.sort(key=get_item_sort_key)
+
+            earned_points = sum(item.get("points_earned", 0) for item in full_evaluation)
+            self.log_message(f"  -> Score Computed: {format_score(earned_points)}/{format_score(max_possible_score)}")
+
+            # NEW: Write the final score to the database
+            self.write_grade_to_db(b_id, group_key, earned_points)
+
+            # Conspectus generation with success tracking
+            is_final = (attempt == max_attempts)
+            compilation_success = self.generate_latex_conspectus(
+                b_id, student_info, data["original_title"], earned_points,
+                max_possible_score, full_evaluation, sorted_page_paths, eval_dir,
+                is_final_attempt=is_final
+            )
+
+            if compilation_success:
+                break # Success! Exit the retry loop.
+            else:
+                self.log_message(f"[!] LaTeX Compilation Failed. Re-triggering Silo 2...")
+                attempt += 1
+
+        # [PATCH:silo2-bounded-retry] Deferred students were never graded. Record
+        # them in the Tabula as DEFERRED so the teacher sees exactly who needs a
+        # re-run, then skip the normal score append below.
+        if b_id in deferred_ids:
+            if eval_dir not in tabula_records_by_eval_dir:
+                tabula_records_by_eval_dir[eval_dir] = []
+            tabula_records_by_eval_dir[eval_dir].append({
+                "last": student_info['last'], "first": student_info['first'],
+                "b_id": b_id, "score_str": "DEFERRED"
+            })
+            return
+        if not self.is_running:
+            return  # Stop pressed mid-student: no half record
+
+        # Tabula Generation proceeds with the final evaluation result
+        if eval_dir not in tabula_records_by_eval_dir:
+            tabula_records_by_eval_dir[eval_dir] = []
+        tabula_records_by_eval_dir[eval_dir].append({
+            "last": student_info['last'], "first": student_info['first'],
+            "b_id": b_id, "score_str": f"{format_score(earned_points)}/{format_score(max_possible_score)}"
+        })
+
+    def _write_tabulas(self, tabula_records_by_eval_dir):
+        """Tabula generation, extracted verbatim so BATCH collection can call
+        it too. [PATCH:batch]"""
+        if True:
             for eval_dir, records in tabula_records_by_eval_dir.items():
                 tabula_path = os.path.join(eval_dir, "Tabula.csv")
                 merged_data = {}
@@ -4699,7 +7372,9 @@ class LedgerGUI:
                 except Exception as e:
                     self.log_message(f"[!] Error writing Tabula: {e}")
 
-        # Original Scan Cleanup
+    def _move_scans(self, pdf_to_period_map, deferred_ids):
+        """Original scan cleanup, extracted verbatim so BATCH collection can
+        call it too. [PATCH:batch]"""
         self.log_message("=== PASS 2 COMPLETE. MOVING ORIGINAL SCANS ===")
         if deferred_ids:
             self.log_message(f"=== {len(deferred_ids)} STUDENT(S) DEFERRED (grading call failed). Scans RETAINED in '02 Inbox Scans' for re-run; grades use INSERT OR REPLACE and the Tabula de-dupes by ID, so re-running the batch is idempotent: {sorted(deferred_ids)} ===")
@@ -4714,18 +7389,774 @@ class LedgerGUI:
                 except Exception as e:
                     self.log_message(f"[!] Could not move scan {pdf_file}: {e}")
 
+    # ======================================================================
+    # [PATCH:batch] WO-B1: BATCH SCORING (SCORING: BATCH)
+    # Pass 1 and the context build are untouched. In BATCH, Pass 2 submits
+    # every chunk as half-price provider batch requests through the daemon,
+    # keeps a job record in the WORKSPACE (outside the scrubbed temp folder),
+    # polls, then finishes every student through the SAME code path as live
+    # (parse -> count check -> merge -> sort -> score -> DB -> report ->
+    # Tabula -> scan move). One pending job at a time; SHUT DOWN only stops
+    # the polling; startup offers RESUME / CANCEL BATCH.
+    # ======================================================================
+    def _batch_job_save(self, job):
+        """Atomic job-record write: everything needed to finish the run later."""
+        os.makedirs(BATCH_JOB_DIR, exist_ok=True)
+        tmp = BATCH_JOB_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(job, f, indent=1)
+        os.replace(tmp, BATCH_JOB_FILE)
+
+    def _batch_job_load(self):
+        with open(BATCH_JOB_FILE, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _batch_progress(self, text):
+        self.root.after(0, lambda: self.batch_progress_label.configure(text=text))
+
+    def _ask_choice(self, title, message, options):
+        """[PATCH:batch] Modal choice shown from a worker thread; blocks the
+        worker (NOT the UI) until one option is pressed. Returns the label."""
+        result = {}
+        ev = threading.Event()
+
+        def build():
+            win = ctk.CTkToplevel(self.root)
+            win.title(title)
+            self._clamp_toplevel(win, 760, 360)
+            win.transient(self.root)
+            win.protocol("WM_DELETE_WINDOW", lambda: None)  # must choose
+            ctk.CTkLabel(win, text=title, font=self.header_font).pack(pady=(24, 10))
+            ctk.CTkLabel(win, text=message, font=self.main_font,
+                         wraplength=680, justify="left").pack(pady=10, padx=30)
+            row = ctk.CTkFrame(win, fg_color="transparent")
+            row.pack(pady=20)
+
+            def choose(opt):
+                result["choice"] = opt
+                try:
+                    win.grab_release()
+                    win.destroy()
+                except tk.TclError:
+                    pass
+                ev.set()
+
+            for i, opt in enumerate(options):
+                color = "#1e8449" if i == 0 else "#c0392b"
+                hover = "#27ae60" if i == 0 else "#e74c3c"
+                ctk.CTkButton(row, text=opt, font=self.main_font, height=48,
+                              fg_color=color, hover_color=hover,
+                              command=lambda o=opt: choose(o)).pack(side="left", padx=12)
+            self._make_text_copyable(win)
+            win.after(200, win.grab_set)
+
+        self.root.after(0, build)
+        ev.wait()
+        return result.get("choice", options[-1])
+
+    def _batch_request_body(self, custom_id, chunk_desc):
+        """One silo2-shaped request for /api/batch/spool: same payload keys,
+        same prompt, same schema, same per-chunk masters as the live call."""
+        body = {"custom_id": custom_id, "prompt": SILO2_PROMPT,
+                "schema": EVALUATION_SCHEMA}
+        if isinstance(chunk_desc, (list, tuple)):
+            # Essay mode: the chunk is a list of page paths.
+            body["images_b64"] = [self.image_to_base64_png(p) for p in chunk_desc]
+        else:
+            body["image_b64"] = self.image_to_base64_png(chunk_desc["path"])
+            master_ctx = self._s2ctx_master_images_b64(chunk_desc.get("footer_pages"))
+            if master_ctx:
+                body["master_images_b64"] = master_ctx
+        return body
+
+    def _batch_abs_chunk(self, rec):
+        """Job-record chunk entry -> the chunk shape the evaluators expect."""
+        if "pages" in rec:
+            return [os.path.join(BATCH_JOB_DIR, p) for p in rec["pages"]]
+        return {"path": os.path.join(BATCH_JOB_DIR, rec["path"]),
+                "footer_pages": rec.get("footer_pages"),
+                "box_count": rec.get("box_count")}
+
+    def _run_batch_pass2(self, global_batch_data, pdf_to_period_map,
+                         tabula_records_by_eval_dir):
+        """BATCH Pass 2: assemble, warm the cache (Anthropic), submit, then
+        poll and collect. Pacing sleeps apply to live calls only, never to
+        building batch requests."""
+        deferred_ids = set()
+        if not global_batch_data:
+            self.log_message("No students found to evaluate.")
+            self.finish_processing()
+            return
+        group_key, data = next(iter(global_batch_data.items()))
+        model = self.get_silo2_model()
+        m = model.lower()
+        is_anthropic = (m.startswith("claude") or "anthropic/" in m
+                        or m.startswith("publishers/anthropic"))
+
+        # 1. Assemble every student's chunks with the existing functions.
+        assembled = {}
+        for b_id, student_data in data["students"].items():
+            if not self.is_running:
+                self.finish_processing()
+                return
+            if getattr(self, "grading_mode", "boxed") == "essay":
+                chunks = self.assemble_essay_pages(student_data["full_pages"], b_id)
+            else:
+                chunks = self.stitch_snippets_to_grid(
+                    student_data["snippets"], b_id,
+                    student_data.get("snippet_master_pages"))
+            if not chunks:
+                self.log_message(f"[!] No snippets found for {b_id}. Skipping evaluation.")
+                continue
+            student_data["full_pages"].sort(key=lambda x: x["lowest_q"])
+            assembled[b_id] = {
+                "chunks": chunks,
+                "pages": [p["path"] for p in student_data["full_pages"]],
+            }
+        if not assembled:
+            self.log_message("No students found to evaluate.")
+            self.finish_processing()
+            return
+
+        order = list(assembled.keys())
+        # 2. Anthropic only: score the FIRST student live through the existing
+        # path -- this writes the prompt and master pages into Anthropic's
+        # prompt cache so the batched requests can read them. Google skips
+        # this (its batch and cache discounts do not combine).
+        first_live = None
+        if is_anthropic:
+            first_live = order[0]
+            self.log_message(f"-> BATCH: scoring the first student (ID {first_live}) "
+                             "live to warm the provider's prompt cache...")
+            info = self.roster.get(first_live, {"last": "Unknown", "first": "Student"})
+            self._finish_student(group_key, data, first_live, info,
+                                 assembled[first_live]["pages"],
+                                 assembled[first_live]["chunks"],
+                                 tabula_records_by_eval_dir, deferred_ids)
+            if not self.is_running:
+                self.finish_processing()
+                return
+
+        # 3. Build the job record and move the run's files into the job
+        # folder (the temp folder is scrubbed at startup, shutdown and run
+        # end; a pending job must survive all three).
+        job_id = datetime.datetime.now().strftime("job-%Y%m%d-%H%M%S")
+        os.makedirs(os.path.join(BATCH_JOB_DIR, "chunks"), exist_ok=True)
+        os.makedirs(os.path.join(BATCH_JOB_DIR, "pages"), exist_ok=True)
+        master_copy = os.path.join(BATCH_JOB_DIR, "master.pdf")
+        try:
+            shutil.copy(self.master_pdf_path, master_copy)
+        except Exception as e:
+            self.log_message(f"[!] Could not copy the master into the job folder: {e}")
+            self.finish_processing()
+            return
+        job = {
+            "version": 1,
+            "job_id": job_id,
+            "created": datetime.datetime.now().isoformat(),
+            "state": "building",
+            "model": model,
+            "grading_mode": getattr(self, "grading_mode", "boxed"),
+            "master_pdf": master_copy,
+            "assignment": {"group_key": group_key,
+                           "display_title": data["display_title"],
+                           "original_title": data["original_title"],
+                           "max_score": data["max_possible_score"]},
+            "pdf_to_period_map": pdf_to_period_map,
+            "first_student_live": first_live,
+            # [PATCH:box-map] Pass-1 answer-box notices ride in the job so the
+            # end-of-run summary still prints after a shutdown and RESUME.
+            "box_map_notices": list(getattr(self, "_box_map_notices", [])),
+            # [PATCH:run-summary] WO-COS2 T6: the run summary rides in the
+            # job the same way (read back with .get, so an older job record
+            # without the key still loads).
+            "run_summary": self._collect_run_summary_stats(),
+            "submissions": [],
+            "requests": {},
+            "students": {},
+            "tabula": [[d, r] for d, recs in tabula_records_by_eval_dir.items()
+                       for r in recs],
+            "deferred": sorted(deferred_ids),
+        }
+        for b_id in order:
+            if b_id == first_live:
+                continue
+            chunk_recs = []
+            cids = []
+            for i, ch in enumerate(assembled[b_id]["chunks"]):
+                cid = f"{b_id}-c{i}"
+                if isinstance(ch, (list, tuple)):
+                    rels = []
+                    for j, p in enumerate(ch):
+                        rel = os.path.join("chunks", f"{b_id}_c{i}_p{j}.png")
+                        shutil.move(p, os.path.join(BATCH_JOB_DIR, rel))
+                        rels.append(rel)
+                    rec = {"pages": rels}
+                else:
+                    rel = os.path.join("chunks", f"{b_id}_c{i}.png")
+                    shutil.move(ch["path"], os.path.join(BATCH_JOB_DIR, rel))
+                    rec = {"path": rel, "footer_pages": ch.get("footer_pages"),
+                           "box_count": ch.get("box_count")}
+                job["requests"][cid] = {"b_id": b_id, "chunk_index": i,
+                                        "chunk": rec}
+                chunk_recs.append(rec)
+                cids.append(cid)
+            page_rels = []
+            for j, p in enumerate(assembled[b_id]["pages"]):
+                rel = os.path.join("pages", f"{b_id}_p{j:02d}.png")
+                try:
+                    shutil.move(p, os.path.join(BATCH_JOB_DIR, rel))
+                except Exception:
+                    shutil.copy(p, os.path.join(BATCH_JOB_DIR, rel))
+                page_rels.append(rel)
+            job["students"][b_id] = {"chunks": cids, "pages": page_rels,
+                                     "status": "pending"}
+        self._batch_job_save(job)
+
+        # 4. Spool and submit, splitting so no provider batch passes its cap
+        # and no single local request uses unreasonable memory.
+        try:
+            group_n = int(os.environ.get("LEDGER_BATCH_SPOOL_GROUP", "4"))
+        except (TypeError, ValueError):
+            group_n = 4
+        default_cap = "200" if is_anthropic else "700"
+        try:
+            cap_bytes = float(os.environ.get("LEDGER_BATCH_MAX_SUBMISSION_MB",
+                                             default_cap)) * 1e6
+        except (TypeError, ValueError):
+            cap_bytes = float(default_cap) * 1e6
+        all_cids = [cid for b in job["students"].values() for cid in b["chunks"]]
+        self.log_message(f"-> BATCH: submitting {len(all_cids)} request(s) for "
+                         f"{len(job['students'])} student(s) at the provider's "
+                         "half price...")
+        sub_n = 0
+        current = None
+        try:
+            idx = 0
+            while idx < len(all_cids):
+                if current is None:
+                    sub_n += 1
+                    current = {"submission_id": f"{job_id}-s{sub_n}",
+                               "state": "spooling", "custom_ids": [],
+                               "batch_id": None}
+                    job["submissions"].append(current)
+                    self._batch_job_save(job)
+                group = all_cids[idx:idx + group_n]
+                idx += len(group)
+                reqs = [self._batch_request_body(
+                    cid, self._batch_abs_chunk(job["requests"][cid]["chunk"]))
+                    for cid in group]
+                r = requests.post(DAEMON_BASE + "/api/batch/spool",
+                                  json={"submission_id": current["submission_id"],
+                                        "requests": reqs}, timeout=600)
+                self._raise_daemon_error(r)
+                spooled = r.json()
+                current["custom_ids"].extend(group)
+                self._batch_job_save(job)
+                if spooled.get("bytes", 0) >= cap_bytes or idx >= len(all_cids):
+                    # Submit this spool as ONE provider batch. The record is
+                    # saved BEFORE (state submitting) and AFTER (batch id), so
+                    # a crash in between is detectable and never re-submitted
+                    # silently.
+                    current["state"] = "submitting"
+                    self._batch_job_save(job)
+                    r = requests.post(DAEMON_BASE + "/api/batch/submit",
+                                      json={"submission_id": current["submission_id"]},
+                                      timeout=1800)
+                    self._raise_daemon_error(r)
+                    current["batch_id"] = r.json().get("batch_id")
+                    current["state"] = "submitted"
+                    self._batch_job_save(job)
+                    self.log_message(f"-> BATCH: submission "
+                                     f"{current['submission_id']} accepted by the "
+                                     f"provider ({len(current['custom_ids'])} "
+                                     f"request(s)).")
+                    current = None
+        except Exception as e:
+            submitted = [s for s in job["submissions"] if s.get("batch_id")]
+            self.log_message(f"[!] BATCH submission failed: {e}")
+            if not submitted:
+                self.log_message("[!] Nothing reached the provider. The job was "
+                                 "abandoned; scans remain in '02 Inbox Scans' -- "
+                                 "run again (LIVE or BATCH).")
+                shutil.rmtree(BATCH_JOB_DIR, ignore_errors=True)
+                self.finish_processing()
+                return
+            self.log_message("[!] Some submissions DID reach the provider; the "
+                             "job stays pending so the paid work is not lost. "
+                             "Unsubmitted students will be offered live scoring "
+                             "or deferral at collection.")
+        job["state"] = "pending"
+        self._batch_job_save(job)
+
+        # 5-7. Poll, collect, and finish on this same thread.
+        self._batch_poll_and_collect(job)
+
+    def _batch_poll_and_collect(self, job):
+        """Poll the daemon for status every LEDGER_BATCH_POLL_S seconds, show
+        progress, then fetch results and finish each student with the
+        existing code path. Runs on a worker thread; the operator clicks nothing."""
+        try:
+            poll_s = float(os.environ.get("LEDGER_BATCH_POLL_S", "120"))
+        except (TypeError, ValueError):
+            poll_s = 120.0
+        submitted = [s for s in job["submissions"] if s.get("batch_id")]
+        ids = [s["batch_id"] for s in submitted]
+        total = sum(len(s["custom_ids"]) for s in submitted)
+        try:
+            t0 = datetime.datetime.fromisoformat(job["created"])
+        except Exception:
+            t0 = datetime.datetime.now()
+
+        # [PATCH:batch] WO-B1-2 Task 3: while an ANTHROPIC batch is pending,
+        # renew every distinct cached prefix the job uses, every
+        # LEDGER_BATCH_KEEPALIVE_S seconds (default 2700). The cached prompt
+        # lasts one hour; a batch that runs longer would pay the cache-WRITE
+        # price on its remaining requests, erasing most of the batch saving.
+        # A keep-alive failure is logged and never stops or delays collection.
+        _m = (job.get("model") or "").lower()
+        keepalive_stop = threading.Event()
+        if ids and (_m.startswith("claude") or "anthropic/" in _m
+                    or _m.startswith("publishers/anthropic")):
+            threading.Thread(target=self._batch_keepalive_loop,
+                             args=(job, keepalive_stop), daemon=True).start()
+
+        while self.is_running and ids:
+            try:
+                r = requests.get(DAEMON_BASE + "/api/batch/status",
+                                 params={"ids": ",".join(ids)}, timeout=120)
+                self._raise_daemon_error(r)
+                batches = r.json().get("batches", [])
+            except Exception as e:
+                self.log_message(f"[!] Batch status check failed: {e} -- will "
+                                 "try again at the next poll.")
+                batches = []
+            finished = 0
+            all_done = bool(batches)
+            for b in batches:
+                if b.get("error"):
+                    all_done = False
+                    continue
+                counts = b.get("counts") or {}
+                done_here = sum(v for k, v in counts.items()
+                                if k != "processing" and isinstance(v, int))
+                if b.get("done"):
+                    finished += done_here or 0
+                else:
+                    finished += done_here or 0
+                    all_done = False
+            elapsed = datetime.datetime.now() - t0
+            hh, rem = divmod(int(elapsed.total_seconds()), 3600)
+            mm = rem // 60
+            self._batch_progress(f"BATCH: {finished} of {total} requests "
+                                 f"finished · {hh}h {mm:02d}m elapsed")
+            if all_done:
+                break
+            slept = 0.0
+            while slept < poll_s and self.is_running:
+                time.sleep(min(1.0, poll_s - slept))
+                slept += 1.0
+        # [PATCH:batch] WO-B1-2 Task 3: the batch has ended (or the run was
+        # shut down / cancelled) -- stop the keep-alives either way.
+        keepalive_stop.set()
+        if not self.is_running:
+            # SHUT DOWN during a pending job: stop polling and nothing else.
+            return
+
+        # Collect results.
+        self.log_message("-> BATCH: all provider batches have ended. Collecting "
+                         "results and finishing each student...")
+        job["state"] = "collecting"
+        self._batch_job_save(job)
+        results_by_cid = {}
+        gone = False
+        reused_n = succeeded_n = 0
+        for bid_ in ids:
+            try:
+                r = requests.post(DAEMON_BASE + "/api/batch/results",
+                                  json={"id": bid_}, timeout=1800)
+                payload = r.json() if r.content else {}
+                if r.status_code >= 400:
+                    if payload.get("reason") == "results_gone":
+                        gone = True
+                        self.log_message(f"[!] Results for {bid_} are GONE at the "
+                                         f"provider: {payload.get('message', '')}")
+                        continue
+                    raise Exception(payload.get("message") or f"HTTP {r.status_code}")
+                for res in payload.get("results", []):
+                    if res.get("custom_id"):
+                        results_by_cid[res["custom_id"]] = res
+                # [PATCH:batch] WO-B1-2 Task 4: per-batch prompt-reuse counts
+                # (the daemon logs the same with the job's token totals).
+                reused_n += int(payload.get("reused_prompt") or 0)
+                succeeded_n += int(payload.get("succeeded") or 0)
+            except Exception as e:
+                self.log_message(f"[!] Could not fetch results for {bid_}: {e}. "
+                                 "Its requests fall back to the live path below.")
+        # [PATCH:batch] WO-B1-2 Task 4: one plain line on prompt reuse, on
+        # every route where a stored prompt applies: always on the Anthropic
+        # route (an explicit stored prompt is written by the live warm-up
+        # student), and on a Google route only when the provider reported
+        # cached tokens (Google keeps no explicit stored prompt in BATCH).
+        _is_anth_job = (_m.startswith("claude") or "anthropic/" in _m
+                        or _m.startswith("publishers/anthropic"))
+        if succeeded_n and (_is_anth_job or reused_n):
+            self.log_message(f"Batch finished: {reused_n} of {succeeded_n} "
+                             "requests reused the stored prompt.")
+
+        # Requests with NO result at all -- results gone at the provider, a
+        # submission that may or may not have reached the provider, or a
+        # failed fetch. Never re-score those live on our own: say so plainly
+        # and let the operator choose. (Requests the provider explicitly reports as
+        # errored/expired/cancelled are different: they get one automatic
+        # pass through the existing live bounded-retry path below.)
+        live_ok_for_missing = True
+        missing = [cid for cid in job["requests"] if cid not in results_by_cid]
+        if missing:
+            n_students = len({job["requests"][cid]["b_id"] for cid in missing})
+            if gone:
+                why = ("The stored results for some requests were already "
+                       "deleted by the provider or the storage bucket "
+                       "(results are kept only a limited time). The batch "
+                       "price for them is spent either way.")
+            else:
+                why = ("Some requests have no results to collect -- a "
+                       "submission that may or may not have reached the "
+                       "provider, or a fetch that failed. Nothing is ever "
+                       "re-submitted automatically.")
+            choice = self._ask_choice(
+                "SOME BATCH RESULTS ARE UNAVAILABLE",
+                (f"{why}\n\nThis affects {n_students} student(s).\n\n"
+                 "SCORE LIVE NOW evaluates those students again immediately "
+                 "at the full live price. DEFER keeps their scans in "
+                 "'02 Inbox Scans' for a later run and scores nobody twice."),
+                ["SCORE LIVE NOW (full price)", "DEFER THOSE STUDENTS"])
+            live_ok_for_missing = choice.startswith("SCORE LIVE")
+
+        # Finish each student through the existing path.
+        tabula_records_by_eval_dir = {}
+        for d, rec in job.get("tabula", []):
+            tabula_records_by_eval_dir.setdefault(d, []).append(rec)
+        deferred_ids = set(job.get("deferred", []))
+        data = {"display_title": job["assignment"]["display_title"],
+                "original_title": job["assignment"]["original_title"],
+                "max_possible_score": job["assignment"]["max_score"]}
+        group_key = job["assignment"]["group_key"]
+
+        for b_id, srec in job["students"].items():
+            if not self.is_running:
+                return
+            if srec.get("status") == "finished":
+                continue
+            info = self.roster.get(b_id, {"last": "Unknown", "first": "Student"})
+            pages_abs = [os.path.join(BATCH_JOB_DIR, p) for p in srec["pages"]]
+            chunk_descs = [self._batch_abs_chunk(job["requests"][cid]["chunk"])
+                           for cid in srec["chunks"]]
+            merged = []
+            student_ok = True
+            for cid in srec["chunks"]:
+                res = results_by_cid.get(cid)
+                desc = self._batch_abs_chunk(job["requests"][cid]["chunk"])
+                if res and res.get("state") == "succeeded":
+                    try:
+                        parsed = self._parse_silo2_text(res.get("text") or "")
+                    except Exception as e:
+                        self.log_message(f"[!] Could not parse batch result "
+                                         f"{cid}: {e}")
+                        parsed = []
+                    if not isinstance(parsed, list):
+                        parsed = []
+                else:
+                    # Errored, expired, cancelled, or never collected: one
+                    # pass through the existing live bounded-retry path --
+                    # unless the operator chose to defer the gone ones.
+                    state = (res or {}).get("state", "missing")
+                    if not live_ok_for_missing and res is None:
+                        self.log_message(f"  -> [DEFERRED] ID {b_id}: result "
+                                         f"{cid} unavailable and live scoring "
+                                         "was declined.")
+                        student_ok = False
+                        break
+                    why = (res or {}).get("message", "")
+                    self.log_message(f"-> BATCH: request {cid} came back "
+                                     f"'{state}' {why[:160]} -- evaluating that "
+                                     "chunk live instead.")
+                    parsed = self.evaluate_grid_with_silo_2(desc)
+                    if parsed is None:
+                        student_ok = False
+                        break
+                    if not isinstance(parsed, list):
+                        parsed = []
+                # The count check runs on batch results exactly as on live
+                # replies; its re-asks go live through the daemon.
+                if isinstance(desc, dict):
+                    parsed = self._count_check_chunk(desc, parsed)
+                    if parsed is None:
+                        student_ok = False
+                        break
+                merged.extend(parsed)
+            if not student_ok:
+                if self.is_running:
+                    self.log_message(f"  -> [DEFERRED] ID {b_id}: this student's "
+                                     "batch results could not be completed - "
+                                     "not scored. Scan retained for re-run.")
+                    deferred_ids.add(b_id)
+                    srec["status"] = "deferred"
+                    job["deferred"] = sorted(deferred_ids)
+                    self._batch_job_save(job)
+                continue
+            self._finish_student(group_key, data, b_id, info, pages_abs,
+                                 chunk_descs, tabula_records_by_eval_dir,
+                                 deferred_ids, first_evaluation=merged)
+            srec["status"] = "deferred" if b_id in deferred_ids else "finished"
+            job["deferred"] = sorted(deferred_ids)
+            job["tabula"] = [[d, rec] for d, recs in
+                             tabula_records_by_eval_dir.items() for rec in recs]
+            self._batch_job_save(job)
+            if not self.is_running:
+                return
+
+        # Wrap up exactly like a live run.
+        self._write_tabulas(tabula_records_by_eval_dir)
+        self._move_scans(job.get("pdf_to_period_map", {}), deferred_ids)
+        for bid_ in ids:
+            try:
+                requests.post(DAEMON_BASE + "/api/batch/cleanup",
+                              json={"id": bid_}, timeout=300)
+            except Exception:
+                pass
+        shutil.rmtree(BATCH_JOB_DIR, ignore_errors=True)
+        self.log_message("=== BATCH JOB COLLECTED AND CLOSED. ===")
+        # [PATCH:box-map] the job record is authoritative for the notices
+        # (this may be a RESUME in a fresh session); finish_processing prints
+        # the summary after the closing lines.
+        self._box_map_notices = list(job.get("box_map_notices", []))
+        # [PATCH:run-summary] WO-COS2 T6: the job record is authoritative for
+        # the run summary too; an older record without the key -> None, and
+        # finish_processing simply prints no summary.
+        self._run_summary_stats = job.get("run_summary", None)
         self.finish_processing()
+
+    def _batch_keepalive_prefixes(self, job):
+        """[PATCH:batch] WO-B1-2 Task 3: the distinct cached prefixes this
+        job's requests read. None stands for the daemon's full-master
+        context; a list is a per-chunk master page set (master pages only --
+        a keep-alive never carries student content). Built with the same
+        helper the live request uses, so the prefix is byte-identical."""
+        prefixes = [None]
+        seen = {None}
+        for rec in (job.get("requests") or {}).values():
+            ch = rec.get("chunk") or {}
+            fp = ch.get("footer_pages") if isinstance(ch, dict) else None
+            m = self._s2ctx_master_images_b64(fp) if fp else None
+            key = tuple(m) if m else None
+            if key not in seen:
+                seen.add(key)
+                prefixes.append(m)
+        return prefixes
+
+    def _batch_keepalive_loop(self, job, stop_event):
+        """[PATCH:batch] WO-B1-2 Task 3: worker loop. Renews each distinct
+        cached prefix every LEDGER_BATCH_KEEPALIVE_S seconds (default 2700;
+        0 disables) until stop_event is set. Every outcome is logged; no
+        failure ever stops or delays polling or collection."""
+        try:
+            interval = float(os.environ.get("LEDGER_BATCH_KEEPALIVE_S", "2700"))
+        except (TypeError, ValueError):
+            interval = 2700.0
+        if interval <= 0:
+            return
+        try:
+            prefixes = self._batch_keepalive_prefixes(job)
+        except Exception as e:
+            self.log_message(f"[!] BATCH keep-alive disabled for this job: {e}")
+            return
+        while not stop_event.wait(interval):
+            for m in prefixes:
+                if stop_event.is_set():
+                    return
+                try:
+                    payload = {"master_images_b64": m} if m else {}
+                    r = requests.post(DAEMON_BASE + "/api/batch/keepalive",
+                                      json=payload, timeout=600)
+                    data = r.json() if r.content else {}
+                    if r.status_code >= 400 or data.get("status") != "success":
+                        raise Exception(data.get("message")
+                                        or f"HTTP {r.status_code}")
+                    u = data.get("usage") or {}
+                    self.log_message("-> BATCH keep-alive: prompt cache "
+                                     f"renewed (cache_read="
+                                     f"{u.get('cache_read')} tokens).")
+                except Exception as e:
+                    self.log_message("[!] BATCH keep-alive failed (collection "
+                                     f"is unaffected): {e}")
+
+    def check_pending_batch_job(self):
+        """[PATCH:batch] Startup: a pending job gets a RESUME / CANCEL BATCH
+        dialog. Resuming never repeats a paid call and never re-submits."""
+        if not os.path.exists(BATCH_JOB_FILE):
+            return
+        try:
+            job = self._batch_job_load()
+        except Exception as e:
+            self.log_message(f"[!] A pending batch job record exists but could "
+                             f"not be read ({e}). It was left untouched at "
+                             f"{BATCH_JOB_FILE} -- nothing will run until it is "
+                             "resolved.")
+            return
+        n_students = sum(1 for s in job.get("students", {}).values()
+                         if s.get("status") == "pending")
+        ambiguous = [s for s in job.get("submissions", [])
+                     if not s.get("batch_id")]
+        msg = (f"A BATCH scoring job from {job.get('created', '?')[:16]} is "
+               f"still pending: {n_students} student(s), model "
+               f"{job.get('model', '?')}, assignment "
+               f"'{job.get('assignment', {}).get('display_title', '?')}'.\n\n"
+               "RESUME goes back to polling and collecting the finished "
+               "results (nothing is paid twice).\n\nCANCEL BATCH cancels the "
+               "job at the provider, defers the uncollected students and "
+               "keeps their scans in '02 Inbox Scans'.")
+        if ambiguous:
+            msg += ("\n\nNOTE: one submission may or may not have reached the "
+                    "provider (the record shows it mid-submit). On RESUME it "
+                    "is NEVER re-submitted; its students will be offered live "
+                    "scoring or deferral when results are collected.")
+        choice = {}
+
+        def build():
+            win = ctk.CTkToplevel(self.root)
+            win.title("PENDING BATCH JOB")
+            self._clamp_toplevel(win, 780, 420)
+            win.transient(self.root)
+            win.protocol("WM_DELETE_WINDOW", lambda: None)
+            ctk.CTkLabel(win, text="A BATCH JOB IS WAITING",
+                         font=self.header_font).pack(pady=(24, 10))
+            ctk.CTkLabel(win, text=msg, font=self.main_font, wraplength=700,
+                         justify="left").pack(pady=8, padx=30)
+            row = ctk.CTkFrame(win, fg_color="transparent")
+            row.pack(pady=18)
+
+            def pick(what):
+                choice["v"] = what
+                try:
+                    win.grab_release()
+                    win.destroy()
+                except tk.TclError:
+                    pass
+                if what == "resume":
+                    self.is_running = True
+                    self.run_btn.configure(state="disabled")
+                    self.max_score_entry.configure(state="disabled")
+                    self.mode_selector.configure(state="disabled")
+                    self.scoring_selector.configure(state="disabled")
+                    self.master_btn.configure(state="disabled")
+                    self.update_indicator("running")
+                    threading.Thread(target=self._resume_batch_job,
+                                     args=(job,), daemon=True).start()
+                else:
+                    threading.Thread(target=self._cancel_batch_job,
+                                     args=(job,), daemon=True).start()
+
+            ctk.CTkButton(row, text="RESUME", font=self.header_font, height=52,
+                          width=200, fg_color="#1e8449", hover_color="#27ae60",
+                          command=lambda: pick("resume")).pack(side="left", padx=14)
+            ctk.CTkButton(row, text="CANCEL BATCH", font=self.header_font,
+                          height=52, width=220, fg_color="#c0392b",
+                          hover_color="#e74c3c",
+                          command=lambda: pick("cancel")).pack(side="left", padx=14)
+            self._make_text_copyable(win)
+            win.after(200, win.grab_set)
+
+        self.root.after(0, build)
+
+    def _resume_batch_job(self, job):
+        """Resume polling/collecting. Any live call made while finishing
+        needs the daemon's scoring context; after a restart that context is
+        gone, so rebuild it from the saved master path FIRST."""
+        try:
+            self.scoring_mode = "batch"
+            self.grading_mode = job.get("grading_mode", "boxed")
+            self._count_check_learned = {}
+            self.master_pdf_path = job.get("master_pdf")
+            self.global_max_score = job.get("assignment", {}).get("max_score", 0)
+            self.master_group_key = job.get("assignment", {}).get("group_key")
+            self.master_display_title = job.get("assignment", {}).get("display_title")
+            self.master_original_title = job.get("assignment", {}).get("original_title")
+            self.log_message("-> RESUME: rebuilding the evaluation context from "
+                             "the saved master before any live call...")
+            if not self.initialize_silo_2_cache(self.master_pdf_path):
+                self.log_message("[!] The evaluation context could not be "
+                                 "rebuilt. Collection continues, but any chunk "
+                                 "that needs a live call will defer its student.")
+            self._batch_poll_and_collect(job)
+        except Exception as e:
+            self.log_message(f"[!] RESUME failed: {e}. The job record was left "
+                             "in place; restart The Ledger to try again.")
+            self.finish_processing()
+
+    def _cancel_batch_job(self, job):
+        """CANCEL BATCH: cancel at the provider, mark the uncollected
+        students deferred, keep their scans."""
+        for s in job.get("submissions", []):
+            bid_ = s.get("batch_id")
+            if not bid_:
+                continue
+            try:
+                r = requests.post(DAEMON_BASE + "/api/batch/cancel",
+                                  json={"id": bid_}, timeout=300)
+                self._raise_daemon_error(r)
+                self.log_message(f"-> Cancelled at the provider: {bid_}")
+            except Exception as e:
+                self.log_message(f"[!] Could not cancel {bid_}: {e}")
+        pending = sorted(b for b, s in job.get("students", {}).items()
+                         if s.get("status") == "pending")
+        if pending:
+            self.log_message(f"-> {len(pending)} student(s) deferred: {pending}. "
+                             "Their scans stay in '02 Inbox Scans'; run again "
+                             "whenever you like.")
+        shutil.rmtree(BATCH_JOB_DIR, ignore_errors=True)
+        self.log_message("=== BATCH JOB CANCELLED AND CLEARED. System is Idle. ===")
 
     def finish_processing(self):
         self.update_indicator("idle")
         self.run_btn.configure(state="normal")
         self.max_score_entry.configure(state="normal")
         self.mode_selector.configure(state="normal")   # [PATCH:essay-mode]
+        self.scoring_selector.configure(state="normal")   # [PATCH:batch]
+        self.batch_progress_label.configure(text="")      # [PATCH:batch]
         self.master_btn.configure(state="normal")
         self.delete_cache()
         self.clean_temp_directory()
         self.is_running = False
         self.log_message("=== BATCH PROCESSING CONCLUDED. TEMP FOLDER SCRUBBED. ===")
+        # [PATCH:run-summary] WO-COS2 T6: the end-of-run summary, AFTER the
+        # closing line and BEFORE the ANSWER BOX NOTICES block (which stays
+        # last and unchanged). Printed only when Pass 1 actually ran (or a
+        # resumed batch job carries its summary), then cleared -- the
+        # box_map_notices print-once pattern. Never blocks the finish.
+        try:
+            _rs = getattr(self, "_run_summary_stats", None)
+            if _rs is None and getattr(self, "_pass1_ran", False):
+                _rs = self._collect_run_summary_stats()
+            if _rs and _rs.get("ran"):
+                for _rs_line in build_run_summary(_rs):
+                    self.log_message(_rs_line)
+            self._run_summary_stats = None
+            self._pass1_ran = False
+        except Exception as _rs_e:
+            try:
+                self.log_message(f"[!] Run summary error (ignored): {_rs_e}")
+            except Exception:
+                pass
+        # [PATCH:box-map] repeat every answer-box notice AFTER the final
+        # closing lines, LIVE and BATCH alike, so they are the last thing
+        # the teacher reads. Printed once, then cleared.
+        _notices = getattr(self, "_box_map_notices", None)
+        if _notices:
+            self.log_message("=== ANSWER BOX NOTICES -- PLEASE VERIFY THESE PAGES ===")
+            for _line in _notices:
+                self.log_message(f"  {_line}")
+            self._box_map_notices = []
 
     # ======================================================================
     # [PATCH:formatter] WO-F1: FORMAT ASSIGNMENT
@@ -4801,7 +8232,9 @@ class LedgerGUI:
         conv_font = ctk.CTkFont(family="Ubuntu", size=16)
 
         st = {"session": None, "file": None, "pasted": None, "view": None,
-              "previews": []}
+              "previews": [],
+              # [PATCH:fmt-ticker] WO-APP1 T6: elapsed-time ticker state
+              "job_started": None, "job_note": ""}
         self.formatter_busy = False
 
         win.grid_columnconfigure(0, weight=1)
@@ -4892,18 +8325,33 @@ class LedgerGUI:
         rowB.pack(fill="x", padx=8, pady=(2, 2))
 
         ctk.CTkLabel(rowB, text="Your ID Name:", font=ui_font).pack(side="left")
+        # [PATCH:id-compose] WO-APP1 T3: the field takes the NAME only; the
+        # printed label composes as "<name> ID" (id_label_compose). A hint
+        # under the field shows live what will print. Matches the browser.
         id_entry = ctk.CTkEntry(rowB, font=ui_font, width=190,
-                                placeholder_text="Example: Smithian ID")
-        id_entry.pack(side="left", padx=(4, 12))
+                                placeholder_text="Example: Smithian")
+        id_entry.pack(side="left", padx=(4, 2))
+        id_hint = ctk.CTkLabel(rowB, text="", font=small_font,
+                               text_color="#7f8c8d", anchor="w")
+        id_hint.pack(side="left", padx=(0, 12))
+
+        def _update_id_hint(_event=None):
+            composed = id_label_compose(id_entry.get())
+            id_hint.configure(
+                text=f"Will print: {composed}" if composed else "")
+        id_entry.bind("<KeyRelease>", _update_id_hint)
+
         # Prefill: this account's saved formatter name first; otherwise the
         # roster label UNLESS it is still the factory default (then the field
-        # stays empty and Send is refused until a name is typed).
+        # stays empty and Send is refused until a name is typed). Old saved
+        # values and roster labels may be FULL labels -- strip on read.
         _saved_fmt_id = self.get_formatter_setting("formatter_id_label", "")
         _roster_id = self.get_custom_id_label()
         if _saved_fmt_id:
-            id_entry.insert(0, _saved_fmt_id)
+            id_entry.insert(0, id_label_strip(_saved_fmt_id))
         elif _roster_id != "Bartonian ID":
-            id_entry.insert(0, _roster_id)
+            id_entry.insert(0, id_label_strip(_roster_id))
+        _update_id_hint()
 
         type_selector = ctk.CTkSegmentedButton(
             rowB, values=["Assignment", "Quiz", "Exam"], font=ui_font, height=30)
@@ -5081,7 +8529,10 @@ class LedgerGUI:
             title_entry.delete(0, "end")
             title_entry.insert(0, sess.state.get("title", ""))
             id_entry.delete(0, "end")
-            id_entry.insert(0, sess.state.get("id_label", ""))
+            # [PATCH:id-compose] old sessions hold the full label -- show
+            # the bare name; the label re-composes on Send.
+            id_entry.insert(0, id_label_strip(sess.state.get("id_label", "")))
+            _update_id_hint()
             type_selector.set(sess.state.get("doc_type", "Assignment"))
             key_var.set("on" if sess.state.get("make_key") else "off")
             model_entry.delete(0, "end")
@@ -5098,8 +8549,39 @@ class LedgerGUI:
             show_version()
 
         # ---------------- send ----------------
+        # [PATCH:fmt-ticker] WO-APP1 T6: while a job runs, the status line
+        # ticks the elapsed time every couple of seconds (a long first
+        # model call otherwise looks hung). Any note from the worker's log
+        # callback rides along after the elapsed time.
+        def _compose_status():
+            elapsed = formatter_elapsed_label(time.time() - st["job_started"])
+            text = ("Working on it. This usually takes a few minutes.  "
+                    "Elapsed: " + elapsed)
+            if st["job_note"]:
+                text += "  (" + st["job_note"] + ")"
+            return text
+
+        def _tick_status():
+            if not self.formatter_busy or st["job_started"] is None:
+                return                      # job ended: stop cleanly
+            try:
+                status_label.configure(text=_compose_status())
+                self.root.after(2000, _tick_status)
+            except tk.TclError:
+                pass                        # window closed mid-job
+
+        def _set_job_note(note):
+            st["job_note"] = note
+            if self.formatter_busy and st["job_started"] is not None:
+                try:
+                    status_label.configure(text=_compose_status())
+                except tk.TclError:
+                    pass
+
         def _finish_job(result_text_fn):
             self.formatter_busy = False
+            st["job_started"] = None        # [PATCH:fmt-ticker] stop ticker
+            st["job_note"] = ""
             send_btn.configure(state="normal")
             status_label.configure(text="")
             result_text_fn()
@@ -5119,9 +8601,7 @@ class LedgerGUI:
                 sess.state["make_key"] = new_key[0]
                 result = sess.send(instruction,
                                    log=lambda m: self.root.after(
-                                       0, lambda mm=m: status_label.configure(
-                                           text="Working on it. This usually "
-                                                "takes a few minutes.  (" + mm + ")")))
+                                       0, lambda mm=m: _set_job_note(mm)))
             except Exception as e:
                 msg = str(e)
 
@@ -5163,7 +8643,10 @@ class LedgerGUI:
                 say_ledger("The Ledger is evaluating right now. The formatter "
                            "can start when the run finishes.")
                 return "break"
-            id_label = id_entry.get().strip()
+            # [PATCH:id-compose] compose the printed label from the typed
+            # name; strip-then-compose means a pasted full label stays sane.
+            id_name = id_label_strip(id_entry.get())
+            id_label = id_label_compose(id_entry.get())
             if not id_label:
                 say_ledger("Type your ID name first. It prints at the top of "
                            "every page.")
@@ -5197,8 +8680,12 @@ class LedgerGUI:
             # persist the per-account preferences
             self.set_formatter_setting("formatter_model",
                                        model_entry.get().strip() or "claude-fable-5")
-            self.set_formatter_setting("formatter_id_label", id_label)
+            # [PATCH:id-compose] stored value going forward: the BARE name
+            # (composed at use, the browser's way). Old full-label values
+            # are stripped on read, so both generations coexist.
+            self.set_formatter_setting("formatter_id_label", id_name)
             _roster = self.get_custom_id_label()
+            # [PATCH:id-compose] compare the COMPOSED label with the roster's
             if _roster != id_label:
                 note_text = (f'Your roster uses "{_roster}". Change it in '
                              "ROSTER if you want reports to match.")
@@ -5214,8 +8701,10 @@ class LedgerGUI:
             entry_box.delete("1.0", "end")
             self.formatter_busy = True
             send_btn.configure(state="disabled")
-            status_label.configure(text="Working on it. This usually takes "
-                                        "a few minutes.")
+            # [PATCH:fmt-ticker] start the elapsed-time ticker
+            st["job_started"] = time.time()
+            st["job_note"] = ""
+            _tick_status()
             threading.Thread(target=_worker,
                              args=(instruction, new_session_args),
                              daemon=True).start()
@@ -5231,7 +8720,8 @@ class LedgerGUI:
         # Test seam, same pattern as self._wizard_hooks: lets the WO-F1
         # acceptance driver press the real buttons. Never read in production.
         self._fmt_hooks = {"send": send_message, "entry": entry_box,
-                           "id": id_entry, "title": title_entry,
+                           "id": id_entry, "id_hint": id_hint,  # [PATCH:id-compose]
+                           "title": title_entry,
                            "model": model_entry, "conv": conv,
                            "status": status_label, "load_session": load_session,
                            "show_version": show_version,
@@ -5255,8 +8745,10 @@ if __name__ == "__main__":
     except socket.error:
         # The socket is already claimed. Bring the existing window to the front.
         try:
-            # -a searches for the exact window title, switches workspaces if needed, and raises it
-            subprocess.run(['wmctrl', '-a', 'The Ledger'], check=False)
+            # -F -a matches the FULL window title exactly (not a substring, so a
+            # browser tab titled "The Ledger ..." is never raised by mistake),
+            # switches workspaces if needed, and raises the window
+            subprocess.run(['wmctrl', '-F', '-a', MAIN_WINDOW_TITLE], check=False)
         except FileNotFoundError:
             pass # Fails gracefully if wmctrl happens to be missing
         

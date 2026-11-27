@@ -110,7 +110,22 @@ def sub_row(page, items, trailing_gap=True):
     register as ink, so the next label or question drops correctly below
     them. trailing_gap=False lets rows() leave the gap after the LAST row
     to the caller (QGAP_C before the next question)."""
-    from ledger_lib import text_descent
+    from ledger_lib import text_descent, sw
+    # [PATCH:wo-app2] fail clearly instead of silently dropping parts or
+    # drawing captions across the neighbouring column
+    if not 1 <= len(items) <= 2:
+        raise ValueError(
+            f"sub_row takes 1 or 2 items, got {len(items)} — use rows() "
+            "for a question with more sub-parts; it builds the rows")
+    pitch = COL2 - COL1
+    for x, (tag, label, ans) in zip([COL1, COL2], items):
+        limit = (pitch - 8) if (x == COL1 and len(items) == 2) \
+            else (ML + CW - x)
+        if sw(label, "LSerif", BODY) > limit:
+            raise ValueError(
+                f"caption {label!r} is too wide for its column — captions "
+                "are a few words; put the full sub-part wording in "
+                "part_lines (or q_block's prompts) above the grid")
     base = page._begin_text("LSerif", BODY)
     for x, (tag, label, ans) in zip([COL1, COL2], items):
         page.c.setFont("LSerif", BODY)
@@ -122,7 +137,7 @@ def sub_row(page, items, trailing_gap=True):
         if ans is not None:
             page.c.setFont("LSerif", BODY)
             page.c.drawString(x + 14, ytop - SMALL_H / 2.0 - 4, ans)
-    page._mark_ink(ytop - SMALL_H)
+    page._mark_ink(ytop - SMALL_H, box=True)  # [PATCH:below-box-gap] answer boxes
     if trailing_gap:
         page.gap(RGAP_C)
 
@@ -138,6 +153,26 @@ def rows(page, qnum, parts, answers=None):
                         answers[2 * k + j] if answers else None)
                        for j, (lt, lab) in enumerate(chunk)],
                 trailing_gap=(k < len(chunks) - 1))
+
+
+def q_block(page, qnum, stem, parts, prompts=None, answers=None):
+    """One compact worksheet question in ONE call — the required default
+    layout for Assignment/Quiz sub-parts: numbered stem, optional full
+    per-part prompt lines, then the captioned two-column box grid.
+
+    [PATCH:wo-app2] qnum: question number (tags become '5a', '5b', ...).
+    stem: question text, word for word. parts: [(letter, short_caption)] —
+    captions are a FEW WORDS and sit above each box in its column; the full
+    sub-part wording goes in prompts, e.g.
+    ["a.  Which reactant is limiting?  Justify your answer.", ...].
+    answers: key builds only, parallel to parts. The caller still adds
+    QGAP_C before the next question and closes the page with finish_page.
+    """
+    page.q_text(qnum, stem)
+    if prompts:
+        part_lines(page, prompts)
+    page.gap(TGAP_C)
+    rows(page, qnum, parts, answers)
 
 
 def part_lines(page, lines, gap=2):

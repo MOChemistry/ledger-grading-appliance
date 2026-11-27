@@ -12,6 +12,15 @@ Added in v1.1.0. The **FORMAT ASSIGNMENT** window takes an existing assignment â
 4. The finished PDF is checked against the same layout rules the scoring engine relies on (tags, boxes, fonts, page marks). The operator sees the result page by page and can ask for revisions in plain language; each revision is another model call.
 5. Results, scripts, and the conversation are stored under `Ledger Workspace/06 Formatted Assignments/`.
 
+## Changes in v1.2.0
+
+- The layout check that every formatted PDF must pass was fixed so it reads boxes the same way the scoring engine does; before the fix it could report zero boxes on a correct page.
+- The layout library now enforces the minimum white space below every answer box itself, so a script cannot produce a page the checker would reject for tight spacing, and a page with more content than fits now fails at the specific element, naming the question, instead of producing an overfull page.
+- The ID field takes just the name (for example `Smithian`) and the window shows live what will print (`Smithian ID`).
+- The status line shows elapsed time while a format run is in progress.
+- Each session keeps its results, scripts, and crash records; starting a new session with the same title no longer overwrites the old one.
+- First-call reliability and compact layout on Gemini models improved; Claude remains the tested model and Gemini results still vary.
+
 ## Cost and models
 
 Each format run makes one or more calls to the provider **on the operator's own API key**, and long documents are expensive to format; all charges appear on the account whose key is entered. Claude (`claude-fable-5`) is the tested model. Gemini models can be selected, but results vary and are not part of the tested configuration.

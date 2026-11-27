@@ -11,14 +11,14 @@ This procedure is written for a technically qualified operator setting up a dedi
 - Choices that matter when you install Debian:
   - **Xfce** desktop.
   - **No disk encryption, no LVM.** This is the configuration the build was tested in. It means anyone with the machine or its drive can read everything on it.
-  - Username **`paragon`**, exactly. (The program checks for this name.)
-  - Leave the root password empty so the `paragon` account gets administrator rights.
+  - The **first user you create** during the Debian install is the owner of the machine. Any username works; there is no fixed name. <!-- [PATCH:owner-from-sudo-user] -->
+  - Leave the root password empty so that first user gets administrator rights (`sudo`); the build script takes the owner from the account that runs it. <!-- [PATCH:owner-from-sudo-user] -->
 - An internet connection your institution permits for this purpose.
 - **A test key for one AI provider** — Google or Anthropic — on an account your institution controls. You can enter both.
 
 ## Part A — Get the files
 
-1. Log in as `paragon`. Open a terminal: **Applications menu → Terminal Emulator**.
+1. Log in as the owner account you created during the Debian install. Open a terminal: **Applications menu → Terminal Emulator**. <!-- [PATCH:owner-from-sudo-user] -->
 2. Install git. Type your password when asked; nothing shows while you type, which is normal.
    ```
    sudo apt install -y git
@@ -84,7 +84,7 @@ This procedure is written for a technically qualified operator setting up a dedi
 
 ## Part F — Other accounts
 
-20. Other users on this build are ordinary Linux accounts, created with `adduser`. Only `paragon` (or another administrator account) can run first-time setup and use the **ADVANCED** menu.
+20. Other users on this build are ordinary Linux accounts, created with `adduser`. Only the owner account (or another administrator account) can run first-time setup and use the **ADVANCED** menu. <!-- [PATCH:owner-from-sudo-user] -->
 
 ## Part G — Factory reset and data
 

@@ -1,4 +1,5 @@
 """ledger_lib.py - Layout engine for Ledger-format worksheets (author-approved)."""
+import os
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfbase import pdfmetrics
@@ -24,6 +25,18 @@ LH = 15
 STROKE = 1.8
 FOOTER_Y = 34
 CONTENT_BOTTOM = 70
+# [PATCH:below-box-gap] WO-APP1 T2: SINGLE SOURCE OF TRUTH for the minimum
+# VISIBLE white space (pt) below any answer box before the next ink. The
+# checker (format_check.py) IMPORTS this value — never redefine it there or
+# anywhere else. House targets stay QGAP=22 / RGAP=16; this is the floor.
+MIN_BELOW_BOX_PT = 13.0
+# The box border is STROKE wide, centered on the rect path, so its ink
+# reaches STROKE/2 below the path, and the checker measures from that ink
+# edge; round glyph tops also overshoot the nominal cap height by a point
+# or so at raster. A drawing-gap floor of MIN + STROKE (measured ~13.5 pt
+# on the rendered page, floor 13) absorbs both. Verified empirically by
+# tests/test_below_box_gap.py against the checker itself.
+_BELOW_BOX_MIN_GAP = MIN_BELOW_BOX_PT + STROKE
 
 
 def sw(t, f="LSerif", s=BODY):
@@ -103,6 +116,12 @@ class Page:
         self._y = 0.0
         self._prev = None            # None | 'text' | 'ink'
         self._lift = LH - text_descent()
+        # [PATCH:below-box-gap] path bottom of the last ANSWER BOX drawn,
+        # until the next element consumes it (or manual y switches it off)
+        self._box_bottom = None
+        # [PATCH:wo-app3] the question number most recently started on this
+        # page (q_text/rich_line), so an overfull-page error can name it
+        self._q = None
         self.y = self._header()
 
     # [PATCH:formatter-spacing] --------------------------------------------
@@ -114,12 +133,22 @@ class Page:
     def y(self, value):
         self._y = value
         self._prev = None            # manual positioning: legacy behaviour
+        self._box_bottom = None      # [PATCH:below-box-gap]
 
     def _begin_text(self, font="LSerif", size=BODY):
         """Baseline for the next text line. After a box or image, drop by
-        the cap height so the gap above the text is VISIBLE white space."""
+        the cap height so the gap above the text is VISIBLE white space.
+        [PATCH:below-box-gap] Below an ANSWER BOX the library itself
+        guarantees the minimum visible white (MIN_BELOW_BOX_PT): a script
+        that forgot the gap gets it inserted here, mechanically."""
         if self._prev == 'ink':
             self._y -= cap_height(font, size)
+        if self._box_bottom is not None:
+            floor = (self._box_bottom - _BELOW_BOX_MIN_GAP
+                     - cap_height(font, size))
+            if self._y > floor:
+                self._y = floor
+            self._box_bottom = None
         self._prev = None
         return self._y
 
@@ -127,14 +156,37 @@ class Page:
         """Close a text element. page.y keeps its legacy value (baseline −
         leading) so existing scripts read the same y, but the page remembers
         where the text's visible bottom is for the next box()."""
+        self._floor_guard(last_baseline - text_descent(font, size))
         self._y = last_baseline - leading
         self._prev = 'text'
         self._lift = leading - text_descent(font, size)
 
-    def _mark_ink(self, bottom):
-        """Close an element whose bottom edge is visible ink (box, image)."""
+    def _mark_ink(self, bottom, box=False):
+        """Close an element whose bottom edge is visible ink (box, image).
+        [PATCH:below-box-gap] box=True marks it as an ANSWER BOX, arming
+        the minimum-gap floor for whatever is drawn below it next."""
+        self._floor_guard(bottom)                # [PATCH:wo-app3]
         self._y = bottom
         self._prev = 'ink'
+        self._box_bottom = bottom if box else None
+
+    # [PATCH:wo-app3] Overfull pages used to be caught only by finish_page's
+    # assertion, AFTER the whole page had drawn — the error named a page and
+    # a y-number but not the question that went over. Now the FIRST element
+    # whose visible bottom crosses the printable floor raises, naming the
+    # question. This draws nothing and never fires on a page that fits, so
+    # correct scripts render byte-identical.
+    def _floor_guard(self, bottom):
+        if bottom < CONTENT_BOTTOM:
+            q = (f" while drawing question {self._q}"
+                 if self._q is not None else "")
+            raise ValueError(
+                f"page {self.num} is overfull{q}: content reached "
+                f"y={bottom:.1f}, below the printable floor "
+                f"({CONTENT_BOTTOM}) — this page holds too much. Move "
+                "this question (and everything after it) to a new "
+                "page(), and plan pages with compact.est_question() + "
+                "pack() instead of guessing what fits")
 
     def _ink_top(self):
         """Top y for an element whose top edge is visible ink. After text,
@@ -187,6 +239,7 @@ class Page:
         return x
 
     def q_text(self, num, text, indent=22):
+        self._q = num                            # [PATCH:wo-app3]
         base = self._begin_text("LSerif", BODY)  # [PATCH:formatter-spacing]
         self.c.setFont("LSerif", BODY)
         self.c.drawString(ML, base, f"{num})")
@@ -197,6 +250,7 @@ class Page:
         self._end_text(base + LH)
 
     def rich_line(self, num, segs, indent=22):
+        self._q = num                            # [PATCH:wo-app3]
         base = self._begin_text("LSerif", BODY)  # [PATCH:formatter-spacing]
         self.c.setFont("LSerif", BODY)
         self.c.drawString(ML, base, f"{num})")
@@ -213,12 +267,22 @@ class Page:
         self._y -= g        # [PATCH:formatter-spacing] keeps element tracking
 
     def image(self, path, w, h):
+        # [PATCH:wo-app2] fail with the asset name, not a deep decoder error
+        if not os.path.exists(path):
+            raise ValueError(
+                f"image file not found in the working directory: {path!r} — "
+                "use the exact asset file name given in the request")
         x = ML + (CW - w) / 2.0
         y_top = self._ink_top()                  # [PATCH:formatter-spacing]
+        if self._box_bottom is not None:         # [PATCH:below-box-gap]
+            y_top = min(y_top, self._box_bottom - _BELOW_BOX_MIN_GAP)
         self.c.drawImage(ImageReader(path), x, y_top - h, w, h)
         self._mark_ink(y_top - h)
 
     def box(self, w, h, tag, lined=False, grid=False, center=True, x=None):
+        # [PATCH:wo-app2] a numeric tag (box(320, 50, 5)) used to crash deep
+        # in font metrics; the intent is unambiguous, so accept it
+        tag = str(tag)
         c = self.c
         if x is None:
             x = ML + (CW - w) / 2.0 if center else ML
@@ -254,7 +318,7 @@ class Page:
             while ly > y_top - h + 8:
                 c.line(x + 10, ly, x + w - 10, ly)
                 ly -= 24
-        self._mark_ink(y_top - h)                # [PATCH:formatter-spacing]
+        self._mark_ink(y_top - h, box=True)      # [PATCH:below-box-gap]
 
     def done(self):
         self._footer()

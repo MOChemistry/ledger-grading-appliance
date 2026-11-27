@@ -100,7 +100,7 @@ def bubble_strip(page, num, x=None):
         c.circle(cx, cy, r, stroke=1, fill=0)
         c.setFont("LSerif", 8)
         c.drawCentredString(cx, cy - 2.8, letter)
-    page._mark_ink(y_top - MC_H)  # [PATCH:formatter-spacing]
+    page._mark_ink(y_top - MC_H, box=True)  # [PATCH:below-box-gap] answer box
 
 
 def id_box(page, tag, long=False):

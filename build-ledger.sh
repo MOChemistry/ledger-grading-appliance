@@ -11,7 +11,7 @@
 #   sudo bash build-ledger.sh --commit --source /path/to/ledger-source
 #
 # Run it from the desktop user's own terminal with sudo (you type your password once).
-# The desktop user must be named "paragon" (the grader's permission checks use that name).
+# The desktop user is whoever runs it with sudo (SUDO_USER); it must not be root.  # [PATCH:owner-from-sudo-user]
 # Safe to re-run: every step checks what is already there first.
 # Not done by this script: apt upgrade, apt autoremove, any .env / API key (the grader's
 # SYSTEM INITIALIZATION wizard writes those), tests/ (development only), anything appliance-only.
@@ -22,7 +22,7 @@ SOURCE="$SCRIPT_DIR/ledger-source"
 [[ -d "$SOURCE" ]] || SOURCE="$SCRIPT_DIR"   # public repository: engine/, daemon/, system/ sit next to this script
 REQ="$SCRIPT_DIR/requirements.txt"
 COMMIT=0
-OWNER="paragon"
+OWNER="${SUDO_USER:-}"   # [PATCH:owner-from-sudo-user] the account that ran sudo, not the literal "paragon"
 OPT=/opt/ledger
 APPS=/usr/local/share/applications
 
@@ -34,6 +34,8 @@ GUI_WO2_MD5="a203148b26bbe18b5c71a8e991a3c62b"     # GUI after WO2 + WO3 (master
 DAEMON_WO2_MD5="552951d9cf33b1c2ddb981d335bd2e95"  # daemon after WO2 (one comment line; WO3 left it alone, master dc1ad54)
 GUI_V110_MD5="b1228b36f7859694a0c954dda6d5cefd"    # engine with the v1.1.0 assignment formatter (FORMAT ASSIGNMENT window)
 DAEMON_V110_MD5="4d75aa0d9a9446e265236192297b8e20" # daemon v2.10 (formatter endpoints)
+GUI_V120_MD5="579d9d19c97f274a8cbe6b9c5456366c"    # engine v1.2.0 (MANAGE API KEYS, batch scoring, box-map recovery) + owner patch  # [PATCH:owner-from-sudo-user] (was d488ac70e685f2a467f3df3d97e73a13)
+DAEMON_V120_MD5="dd7e18b4ae724045f9c20bf6f95f4c79" # daemon v2.12 (batch endpoints + formatter endpoints)
 
 APT_PKGS=(python3-venv python3-tk python3-dev tesseract-ocr tesseract-ocr-eng zenity wmctrl
           texlive-xetex texlive-latex-extra texlive-science texlive-fonts-recommended
@@ -74,7 +76,8 @@ log "Ledger INDIVIDUAL build, Layer 1 -- mode: $( (( COMMIT )) && echo COMMIT ||
 [[ $EUID -eq 0 ]] || die "run with sudo: sudo bash $0   (add --commit to really build)"
 . /etc/os-release
 [[ "${ID:-}" == "debian" && "${VERSION_ID:-}" == "13" ]] || die "this is not Debian 13 (found: ${PRETTY_NAME:-unknown})"
-[[ "${SUDO_USER:-}" == "$OWNER" ]] || die "run this from the '$OWNER' account with sudo (found: '${SUDO_USER:-root}')"
+# [PATCH:owner-from-sudo-user] any desktop account may own the build; only an empty SUDO_USER or root is refused
+[[ -n "${SUDO_USER:-}" && "${SUDO_USER:-}" != "root" ]] || die "run this from the desktop user's account with sudo, not as root (found: '${SUDO_USER:-root}')"
 OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"
 for f in engine/ledger-main-minimus.py daemon/vertex-api-daemon.py system/ledger-daemon.service \
          system/ledger-start.desktop system/ledger-shutdown.desktop system/ledger-start.svg \
@@ -85,7 +88,9 @@ done
 command -v git >/dev/null || die "git is not installed: sudo apt install git"
 GUI_NOW="$(md5sum < "$SOURCE/engine/ledger-main-minimus.py" | cut -d' ' -f1)"
 DAEMON_NOW="$(md5sum < "$SOURCE/daemon/vertex-api-daemon.py" | cut -d' ' -f1)"
-if [[ "$GUI_NOW" == "$GUI_V110_MD5" && "$DAEMON_NOW" == "$DAEMON_V110_MD5" ]]; then
+if [[ "$GUI_NOW" == "$GUI_V120_MD5" && "$DAEMON_NOW" == "$DAEMON_V120_MD5" ]]; then
+    FINAL=1   # the v1.2.0 public-repository tree (formatter + batch + key manager): nothing to patch
+elif [[ "$GUI_NOW" == "$GUI_V110_MD5" && "$DAEMON_NOW" == "$DAEMON_V110_MD5" ]]; then
     FINAL=1   # the v1.1.0 public-repository tree (formatter included): nothing to patch
 elif [[ "$GUI_NOW" == "$GUI_WO2_MD5" && "$DAEMON_NOW" == "$DAEMON_WO2_MD5" ]]; then
     FINAL=1   # the v1.0.x public-repository tree: already the accepted build, nothing to patch
@@ -94,10 +99,13 @@ elif [[ "$GUI_NOW" == "$GUI_SRC_MD5" && "$DAEMON_NOW" == "$DAEMON_MD5" ]]; then
 else
     die "engine/daemon are not a version this script was tested with"
 fi
-if [[ "$GUI_NOW" == "$GUI_V110_MD5" ]]; then
+if [[ "$GUI_NOW" == "$GUI_V110_MD5" || "$GUI_NOW" == "$GUI_V120_MD5" ]]; then
     for f in formatter/formatter_core.py formatter/SKILL.md formatter/scripts/ledger_lib.py; do
-        [[ -f "$SOURCE/$f" ]] || die "missing $SOURCE/$f (the v1.1.0 engine needs the formatter folder; use --source DIR)"
+        [[ -f "$SOURCE/$f" ]] || die "missing $SOURCE/$f (the v1.1.0+ engine needs the formatter folder; use --source DIR)"
     done
+fi
+if [[ "$GUI_NOW" == "$GUI_V120_MD5" ]]; then
+    [[ -f "$SOURCE/engine/ledger_keyenv.py" ]] || die "missing $SOURCE/engine/ledger_keyenv.py (the v1.2.0 engine needs it; use --source DIR)"
 fi
 log "OK     Debian $VERSION_ID, user $OWNER, source $SOURCE ($( (( FINAL )) && echo 'accepted build, no patches needed' || echo 'original tree, patches will be applied'))"
 
@@ -145,7 +153,9 @@ if [[ -d "$OPT/.git" ]]; then
 else
     for f in "$SOURCE"/engine/*; do
         b="$(basename "$f")"
-        if printf '%s\n' "${ENGINE_SKIP[@]}" | grep -qxF "$b"; then
+        if [[ "$b" == *.orig || "$b" == *.bak* ]]; then
+            log "SKIP   engine/$b (editor/patch backup, never installed)"
+        elif printf '%s\n' "${ENGINE_SKIP[@]}" | grep -qxF "$b"; then
             log "SKIP   engine/$b (appliance-only)"
         else
             act "copy engine/$b" cp -- "$f" "$OPT/engine/"
@@ -999,10 +1009,14 @@ act "re-close $OPT to others" chmod -R u=rwX,g=rX,o= "$OPT"
 
 # ---------------------------------------------------------------- 5. daemon unit
 UNIT=/etc/systemd/system/ledger-daemon.service
-if cmp -s "$SOURCE/system/ledger-daemon.service" "$UNIT"; then
+# [PATCH:owner-from-sudo-user] the unit runs as $OWNER, not the literal "paragon"; the installed file is compared
+# [PATCH:owner-from-sudo-user] against the REWRITTEN content (not the raw source) so re-runs do not reinstall every time
+UNIT_WANT="$(sed -e "s/^User=.*/User=$OWNER/" -e "s/^Group=.*/Group=$OWNER/" "$SOURCE/system/ledger-daemon.service")"
+if [[ -f "$UNIT" && "$(cat "$UNIT")" == "$UNIT_WANT" ]]; then
     skip "unit $UNIT"
 else
     act "install the daemon unit" install -o root -g root -m 0644 "$SOURCE/system/ledger-daemon.service" "$UNIT"
+    act "rewrite User=/Group= in the unit to $OWNER" sed -i -e "s/^User=.*/User=$OWNER/" -e "s/^Group=.*/Group=$OWNER/" "$UNIT"   # [PATCH:owner-from-sudo-user]
     act "reload systemd" systemctl daemon-reload
 fi
 if systemctl is-enabled -q ledger-daemon.service 2>/dev/null; then

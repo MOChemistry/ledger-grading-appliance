@@ -33,7 +33,12 @@ not re-implementation.
    with the library text paths (q_text / plain_line / rich_line / sub_row /
    part_lines / pts_line / section_banner), never with raw canvas
    drawString, or the engine cannot keep this rule and the spacing check
-   will fail the page. Never go tighter than the compact values — jammed
+   will fail the page. The library also enforces the hard floor itself
+   (rev. Nov 2026): text or an image drawn below an answer box through the
+   library paths is pushed down to at least the checker's minimum white
+   space (ledger_lib.MIN_BELOW_BOX_PT) even if a gap() was forgotten —
+   still use the house gap values above; the floor is a safety net, not a
+   target. Never go tighter than the compact values — jammed
    spacing reads as unprofessional, and so do half-empty pages: spread
    leftover space with deliberate gaps. NOTE: if an exemplar PDF in
    references/exemplars/ shows tighter spacing below boxes, it predates
@@ -50,13 +55,34 @@ bold-italic underlined and "Bartonian ID" bold-italic:
 
 ## Document modes
 **Worksheet / quiz / homework** (widgets.py, compact.py): numbered questions
-with sub-part boxes on the column grid; compact density by default.
+with sub-part boxes on the column grid. For Assignment and Quiz documents the
+compact captioned two-column box grid is the REQUIRED default: each sub-part
+answer in a SMALL box on the COL1/COL2 grid under its own short caption
+(`compact.rows` / `compact.sub_row`, or the one-call `compact.q_block`),
+several questions per page (`compact.est_question` + `compact.pack`).
+Full-width single boxes are reserved for free-response/essay items (verbal
+answers, data tables, graphs, drawings) — never for short numeric or
+identification sub-parts. The right calls for a typical computational
+question:
+
+```python
+q_block(p, 5, "The reaction between phosphorus and liquid bromine is "
+              "outlined below.  5.78 g of P react with 27.9 g of Br2.",
+        [("a", "limiting reactant"), ("b", "theoretical yield (g)"),
+         ("c", "percent yield")],
+        prompts=["a.  Which reactant is limiting?  Justify your answer.",
+                 "b.  What is the maximum mass of PBr3 produced?",
+                 "c.  If 22.3 g are recovered, find the percent yield."])
+p.gap(QGAP_C)   # ... next question on the same page when pack() says it fits
+finish_page(p, lows)
+```
 **Exam / practice exam** (exam_widgets.py): section banners, Scantron-style MC
 bubble strips, free-response boxes chosen by response type. The modes share
 the engine and every rule above and may be mixed in one document.
 
 ## Density (worksheet mode)
-Compact (default): multiple questions per page, figures ~200–215 pt wide,
+Compact (the REQUIRED default for Assignment/Quiz documents, above): multiple
+questions per page, figures ~200–215 pt wide,
 students work on scratch paper. Spacious (on request, or when work must be
 shown on the page): one question per page, figures ~285–330 pt wide. Page
 budget for packing: ~625 pt of content below the header. Estimates carry

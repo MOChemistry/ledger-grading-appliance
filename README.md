@@ -29,6 +29,14 @@ Two providers are supported: **Google** (Gemini models, via a Google AI Studio k
 
 The **FORMAT ASSIGNMENT** window re-typesets an existing assignment — a PDF or pasted questions — into the Ledger format described in [docs/ASSIGNMENT_FORMAT.md](docs/ASSIGNMENT_FORMAT.md). The AI model writes a short Python layout script, and the machine runs that script locally, sandboxed with bubblewrap (no network access), to produce the PDF; the result is then checked against the same layout rules the scoring engine relies on. The source assignment is sent to the configured provider, and **each format run costs API usage on the operator's own key**. Claude (`claude-fable-5`) is the tested model; results with Gemini models vary. Details: [docs/FORMATTER.md](docs/FORMATTER.md).
 
+## Batch scoring (v1.2.0)
+
+The **SCORING** switch on the main window can submit a whole inbox as a **provider batch job** instead of scoring page sets one call at a time; both providers sell batched requests at a discount. The same images leave the machine as in live scoring (see the table below), but they are uploaded in one spool and the provider holds the job's results until the software collects them, for a period set by the provider's terms; the software deletes an ended batch at the provider once every ID in the job is finished or deferred. On the Google Cloud route the batch input is staged in a `ledger-batch-<project-id>` storage bucket in the operator's own project with a 2-day auto-delete rule. A batch job survives a restart and can be resumed, and no score is committed if the provider's answer dropped a question.
+
+## Managing keys (v1.2.0)
+
+The **MANAGE API KEYS** window (under ADVANCED) adds, replaces, or clears the two direct-route keys after initialization, with show/hide and a per-provider status line. Changes are applied by a small root helper through one system password prompt; every other line of the key file is preserved byte-for-byte, at least one working provider must remain, and no key value is logged or echoed back.
+
 ## What leaves the machine
 
 Every image below is sent over the internet to the AI provider configured on the machine. **Review this table against your institution's data-governance policy before testing with any real material.**
@@ -41,6 +49,7 @@ Every image below is sent over the internet to the AI provider configured on the
 | Crops of the boxed answer regions | Every page, **WORKSHEET (BOXED)** mode | Handwriting inside the boxes, and anything else inside them |
 | **Whole pages**, downscaled | Every page, **ESSAY (FULL-PAGE)** mode | **Everything on the page**, including any name or other writing outside the boxes |
 | The source assignment (page images, extracted text, and on the Claude route the PDF itself) | Every **FORMAT ASSIGNMENT** run | The assignment being formatted |
+| The same images as the selected scoring mode, spooled as one batch file | Every scoring run with **SCORING** set to **BATCH** | The same as that mode's rows above; held by the provider until collected (see "Batch scoring") |
 
 The software does not send a roster, real names it has stored, or the gradebook. It cannot stop a person from writing a name, or anything else, on the paper, and in ESSAY mode the whole page is sent.
 
@@ -72,6 +81,7 @@ The software ships with **no built-in scoring instructions**; the operator enter
 
 - **v1.0.x — experimental evaluation release.** Built from a blank disk and exercised against both providers on 2026-10-24. Intended for evaluation by a technically qualified operator. See [SECURITY.md](SECURITY.md) and [DISCLAIMER.md](DISCLAIMER.md).
 - **v1.1.0 — adds the assignment formatter.** The scoring path is unchanged. See [docs/FORMATTER.md](docs/FORMATTER.md).
+- **v1.2.0 — batch scoring, the MANAGE API KEYS window, formatter and scan-reading reliability.** See the release notes and [docs/FORMATTER.md](docs/FORMATTER.md).
 - A separate, hardened build exists for controlled pilots. It is not part of this release.
 
 ## The web app

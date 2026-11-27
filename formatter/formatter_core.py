@@ -132,11 +132,58 @@ def _read_kit(relpath):
         return fh.read()
 
 
+# [PATCH:wo-app2] Mirror of the daemon's routing rule
+# (vertex-api-daemon.py::_provider_for) — KEEP IN SYNC. Used only to decide
+# whether the Gemini-route addendum below is appended to the system prompt,
+# so the addendum is served exactly when the daemon routes to Google.
+def _provider_for(model_name):
+    m = (model_name or "").lower()
+    if (m.startswith("claude") or "anthropic/" in m
+            or m.startswith("publishers/anthropic")):
+        return "anthropic"
+    return "google"
+
+
+# [PATCH:wo-app2] Gemini-route-only addendum. APPENDED AT THE END of the
+# assembled prompt, so the Anthropic route's prompt stays byte-identical
+# (tests/test_wo_app2_prompt.py proves it) and each route's prompt is
+# individually byte-stable for provider-side caching.
+_GEMINI_ADDENDUM = """\
+
+
+===== ADDENDUM FOR THIS MODEL ROUTE =====
+
+Three corrections that past runs on this route needed:
+
+1. Script correctness: first scripts from this route have crashed by \
+calling a helper that does not exist in the library or passing arguments \
+a signature does not take. The complete library source is above — before \
+replying, re-check every import and call against it, and prefer the \
+public worksheet paths (q_text / part_lines / rows / q_block / \
+finish_page) over hand-built drawing code on page.c or the underscore \
+helpers.
+
+2. Layout: for Assignment and Quiz documents the compact captioned \
+two-column box grid is the REQUIRED default (compact.q_block or \
+compact.rows, several questions per page via est_question + pack), as \
+the format spec above states. Do not place one wide box under each \
+sub-question; full-width boxes are only for free-response/essay items.
+
+3. Pagination: never guess how many questions fit on a page — before \
+writing any page, compute every question's height with \
+compact.est_question() and let compact.pack() assign questions to pages \
+(the page budget is 625 pt; three multi-part grid questions do NOT fit \
+on one page).
+"""
+
 _SYSTEM_PROMPT_CACHE = None
 
 
-def assemble_system_prompt():
-    """Order per work-order §2.4; assembled once, byte-stable."""
+def assemble_system_prompt(model_name=None):
+    """Order per work-order §2.4; assembled once, byte-stable.
+    [PATCH:wo-app2] with a model name that routes to Google, the
+    Gemini-only addendum is appended at the end; the base (= the
+    Anthropic route's prompt) is unchanged byte-for-byte."""
     global _SYSTEM_PROMPT_CACHE
     if _SYSTEM_PROMPT_CACHE is None:
         parts = [_ROLE_AND_CONTRACT]
@@ -154,6 +201,8 @@ def assemble_system_prompt():
             parts.append(f"\n\n===== scripts/{ex} =====\n\n"
                          + _read_kit(os.path.join("scripts", ex)))
         _SYSTEM_PROMPT_CACHE = "".join(parts)
+    if model_name is not None and _provider_for(model_name) == "google":
+        return _SYSTEM_PROMPT_CACHE + _GEMINI_ADDENDUM
     return _SYSTEM_PROMPT_CACHE
 
 
@@ -340,7 +389,7 @@ def _call_model_once(model_name, messages, log=None):
     import requests
 
     payload = {"model_name": model_name,
-               "system": assemble_system_prompt(),
+               "system": assemble_system_prompt(model_name),
                "messages": messages}
     resp = requests.post(f"{DAEMON_URL}/api/formatter/start", json=payload,
                          timeout=120)
@@ -480,7 +529,8 @@ class FormatterSession:
         self.state = {"title": "", "id_label": "", "doc_type": "Assignment",
                       "make_key": False, "model": "claude-fable-5",
                       "instructions": [], "versions": [], "transcript": [],
-                      "source": None, "usage_log": []}
+                      "source": None, "usage_log": [],
+                      "attempts": []}  # [PATCH:wo-app2] failed-attempt log
 
     # -- creation / persistence ------------------------------------------
     @classmethod
@@ -488,6 +538,15 @@ class FormatterSession:
                file_path=None, pasted_text=None):
         os.makedirs(FORMATTED_DIR, exist_ok=True)
         folder = os.path.join(FORMATTED_DIR, _safe_title(title))
+        # [PATCH:wo-app2] NEVER reuse an existing session's folder: a second
+        # run with the same title used to silently overwrite the first
+        # session's conversation, scripts and PDFs (it destroyed today's
+        # claude-fable-5 "PRACTICE: Limiting Reagent" session). A fresh
+        # same-titled session now gets "<Title> (2)", "(3)", ...
+        base, k = folder, 2
+        while os.path.isfile(os.path.join(folder, "conversation.json")):
+            folder = f"{base} ({k})"
+            k += 1
         os.makedirs(folder, exist_ok=True)
         sess = cls(folder)
         st = sess.state
@@ -564,6 +623,30 @@ class FormatterSession:
         if usage:
             self.state["usage_log"].append(usage)
 
+    def _record_attempt(self, script_text, error_text, during):
+        """[PATCH:wo-app2] Keep every FAILED build attempt on disk, in the
+        session's attempts/ folder. Before this, only accepted versions
+        were stored, so a 'fixing a crash' retry left no trace of WHAT
+        crashed — today's Gemini crash evidence was lost exactly this way.
+        Record-keeping must never block a run, hence the broad except."""
+        try:
+            a_dir = os.path.join(self.folder, "attempts")
+            os.makedirs(a_dir, exist_ok=True)
+            n = len(self.state.setdefault("attempts", [])) + 1
+            sp = os.path.join(a_dir, f"attempt_{n:02d}_build.py")
+            ep = os.path.join(a_dir, f"attempt_{n:02d}_error.txt")
+            with open(sp, "w", encoding="utf-8") as fh:
+                fh.write(script_text or "")
+            with open(ep, "w", encoding="utf-8") as fh:
+                fh.write(error_text or "")
+            self.state["attempts"].append({
+                "n": n, "during": during, "script_path": sp,
+                "error_path": ep,
+                "at": datetime.datetime.now().isoformat(timespec="seconds")})
+            self.save()
+        except Exception:  # noqa: BLE001
+            pass
+
     # -- the loop (§2.6) --------------------------------------------------
     def send(self, instruction, log=None):
         """One teacher message -> up to MAX_MODEL_CALLS model calls ->
@@ -597,10 +680,13 @@ class FormatterSession:
             self._log_usage(usage)
             return parse_reply(text)
 
-        def run(sc):
+        def run(sc, during="build"):
             say("running the build script...")
             assets = [p for _n, p in st["source"]["assets"]]
-            return format_runner.run_build_script(sc, asset_paths=assets)
+            rr = format_runner.run_build_script(sc, asset_paths=assets)
+            if not rr["ok"]:  # [PATCH:wo-app2] keep the failed attempt
+                self._record_attempt(sc, rr["error"], during)
+            return rr
 
         current = None
         if st["versions"]:
@@ -622,7 +708,7 @@ class FormatterSession:
                 note = note2 or note
             if script is None:
                 raise RuntimeError("The model did not return a build script.")
-            run_res = run(script)
+            run_res = run(script, "first script of the request")
 
             # 2. crash -> up to 2 corrected full scripts
             crash_fixes = 0
@@ -639,7 +725,7 @@ class FormatterSession:
                                + (run_res["error"] or "")), "fixing a crash")
                 if s2:
                     note, script = (n2 or note), s2
-                    run_res = run(script)
+                    run_res = run(script, f"crash fix {crash_fixes}")
             if not run_res["ok"]:
                 raise RuntimeError(run_res["error"] or
                                    "The build script kept failing.")
@@ -660,7 +746,7 @@ class FormatterSession:
                                "\n\nReply with the note and the corrected "
                                "COMPLETE script."), "fixing the read test")
                 if s2:
-                    rr2 = run(s2)
+                    rr2 = run(s2, "read-test fix")
                     if rr2["ok"]:
                         ck2 = format_check.check_pdf(rr2["pdf_path"],
                                                      rr2["boxes"],
@@ -697,7 +783,7 @@ class FormatterSession:
                                "and the corrected COMPLETE script.",
                     extra_images=page_pngs), "looks check")
                 if s2 and calls <= MAX_MODEL_CALLS:
-                    rr2 = run(s2)
+                    rr2 = run(s2, "looks-check fix")
                     if rr2["ok"]:
                         ck2 = format_check.check_pdf(rr2["pdf_path"],
                                                      rr2["boxes"],
